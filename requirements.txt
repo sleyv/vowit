@@ -1,1 +1,4 @@
-
+numpy
+aiohttp
+onnxruntime
+av
