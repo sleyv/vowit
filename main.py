@@ -454,4 +454,23 @@ async def main():
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    asyncio.run(main())
+
+    if len(sys.argv) > 1 and sys.argv[1] == "toggle":
+        try:
+            with open(PID_FILE, "r") as f:
+                pid = int(f.read().strip())
+            os.kill(pid, signal.SIGUSR1)
+            print(f"Sent toggle signal to daemon (PID: {pid})")
+        except FileNotFoundError:
+            print("Daemon is not running. Start it first without arguments.")
+            sys.exit(1)
+        except ProcessLookupError:
+            print("Daemon process not found. It might have crashed. Restart it.")
+            if os.path.exists(PID_FILE):
+                os.remove(PID_FILE)
+            sys.exit(1)
+        except Exception as e:
+            print(f"Error signaling daemon: {e}")
+            sys.exit(1)
+    else:
+        asyncio.run(main())
