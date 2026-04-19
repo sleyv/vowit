@@ -273,6 +273,8 @@ async def fix_text_with_llm(text: str) -> str:
 
     system_prompt = (
         "Your task is to slightly fix grammar and divide the text into paragraphs. "
+        "Please note that the text is a transcribed voice memo, so it may contain "
+        "miswordings or phonetic errors. Account for this in your corrections. "
         "Make minimal changes. Do not remake the text fully. Respond ONLY with the fixed text."
     )
 
@@ -514,7 +516,7 @@ class AudioDaemon:
             last_id = None
             if "продолжение следует" in text.lower():
                 # Technically an error/silence state, play error or silence sound
-                play_sound("/usr/share/sounds/freedesktop/stereo/dialog-error.oga")
+                play_sound("/usr/share/sounds/freedesktop/stereo/message.oga")
                 last_id = send_notification("🔇 Тишина", "Голос не обнаружен")
             elif text and text != "null":
                 if os.path.exists(FIX_FLAG_FILE):
@@ -532,7 +534,7 @@ class AudioDaemon:
                 last_id = send_notification("✅ Запись обработана", clean_text)
             else:
                 # Play error sound
-                play_sound("/usr/share/sounds/freedesktop/stereo/dialog-error.oga")
+                play_sound("/usr/share/sounds/freedesktop/stereo/message.oga")
                 last_id = send_notification("❌ Ошибка", "Не удалось распознать текст")
 
             # Let the notification stay for 4 seconds, then close it
@@ -546,7 +548,7 @@ class AudioDaemon:
             logging.error(f"Error during audio processing: {e}")
             if repl_id:
                 close_notification(repl_id)
-            play_sound("/usr/share/sounds/freedesktop/stereo/dialog-error.oga")
+            play_sound("/usr/share/sounds/freedesktop/stereo/message.oga")
             last_id = send_notification("❌ Системная Ошибка", str(e))
             await asyncio.sleep(4)
             if last_id:
