@@ -5,12 +5,18 @@ import signal
 PID_FILE = "/tmp/groq_audio_daemon.pid"
 
 # Quick toggle path that doesn't require any third-party libraries
-if len(sys.argv) > 1 and sys.argv[1] == "toggle":
+if len(sys.argv) > 1 and sys.argv[1] in ("toggle", "toggle_sys"):
     try:
         with open(PID_FILE, "r") as f:
             pid = int(f.read().strip())
-        os.kill(pid, signal.SIGUSR1)
-        print(f"Sent toggle signal to daemon (PID: {pid})")
+
+        if sys.argv[1] == "toggle":
+            os.kill(pid, signal.SIGUSR1)
+            print(f"Sent toggle (MIC) signal to daemon (PID: {pid})")
+        elif sys.argv[1] == "toggle_sys":
+            os.kill(pid, signal.SIGUSR2)
+            print(f"Sent toggle (SYS) signal to daemon (PID: {pid})")
+
     except FileNotFoundError:
         print("Daemon is not running. Start it first without arguments.")
         sys.exit(1)
@@ -347,14 +353,17 @@ class AudioDaemon:
             if chunk:
                 self.audio_chunks.append(chunk)
 
-    def start_recording(self):
+    def start_recording(self, source="mic"):
         if self.is_recording:
             return
 
         self.is_recording = True
         self.audio_chunks = []
 
-        notif_id = send_notification("🎙️ Запись", "Говорите...")
+        title = "🎙️ Запись (Микрофон)" if source == "mic" else "🔊 Запись (Система)"
+        msg = "Говорите..." if source == "mic" else "Захват системного звука..."
+
+        notif_id = send_notification(title, msg)
         if notif_id:
             with open(ID_FILE, "w") as f:
                 f.write(notif_id)
@@ -367,8 +376,10 @@ class AudioDaemon:
             stderr=subprocess.DEVNULL
         )
 
+        input_device = "default" if source == "mic" else "@DEFAULT_SINK@.monitor"
+
         ffmpeg_cmd = [
-            "ffmpeg", "-nostdin", "-v", "quiet", "-f", "pulse", "-i", "default",
+            "ffmpeg", "-nostdin", "-v", "quiet", "-f", "pulse", "-i", input_device,
             "-metadata", "title=groq_audio", "-ac", "1", "-ar", "16000",
             "-c:a", "libopus", "-f", "ogg", "-"
         ]
@@ -444,14 +455,22 @@ class AudioDaemon:
 
             last_id = None
             if "продолжение следует" in text.lower():
+                # Technically an error/silence state, play error or silence sound
+                subprocess.Popen(["paplay", "/usr/share/sounds/freedesktop/stereo/dialog-error.oga"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 last_id = send_notification("🔇 Тишина", "Голос не обнаружен", repl_id)
             elif text and text != "null":
                 subprocess.run(["wl-copy"], input=text, text=True)
                 clean_text = " ".join(text.splitlines())[:40]
                 if len(text) > 40:
                     clean_text += "..."
+
+                # Play success transcription sound
+                subprocess.Popen(["paplay", "/usr/share/sounds/freedesktop/stereo/complete.oga"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
                 last_id = send_notification("✅ Запись обработана", clean_text, repl_id)
             else:
+                # Play error sound
+                subprocess.Popen(["paplay", "/usr/share/sounds/freedesktop/stereo/dialog-error.oga"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 last_id = send_notification("❌ Ошибка", "Не удалось распознать текст", repl_id)
 
             # Let the notification stay for 4 seconds, then close it
@@ -463,6 +482,7 @@ class AudioDaemon:
                 os.remove(ID_FILE)
         except Exception as e:
             logging.error(f"Error during audio processing: {e}")
+            subprocess.Popen(["paplay", "/usr/share/sounds/freedesktop/stereo/dialog-error.oga"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             last_id = send_notification("❌ Системная Ошибка", str(e), repl_id)
             await asyncio.sleep(4)
             if last_id:
@@ -474,7 +494,13 @@ class AudioDaemon:
         if self.is_recording:
             self.stop_recording()
         else:
-            self.start_recording()
+            self.start_recording(source="mic")
+
+    def toggle_sys(self):
+        if self.is_recording:
+            self.stop_recording()
+        else:
+            self.start_recording(source="sys")
 
 async def main():
     # Write PID so we can signal this process
@@ -486,6 +512,7 @@ async def main():
 
     # Bind toggle to SIGUSR1
     loop.add_signal_handler(signal.SIGUSR1, daemon.toggle)
+    loop.add_signal_handler(signal.SIGUSR2, daemon.toggle_sys)
 
     stop_event = asyncio.Event()
 
