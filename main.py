@@ -40,7 +40,6 @@ import io
 import struct
 import logging
 import subprocess
-import json
 from collections import deque
 
 import aiohttp
@@ -48,8 +47,10 @@ import numpy as np
 import av
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
-load_dotenv()
+# Load environment variables from .env file relative to this script
+script_dir = os.path.dirname(os.path.abspath(__file__))
+env_path = os.path.join(script_dir, ".env")
+load_dotenv(env_path)
 
 TARGET_RMS = 0.05
 MAX_GAIN = 1.5
@@ -555,6 +556,9 @@ class AudioDaemon:
                 close_notification(last_id)
             if os.path.exists(ID_FILE):
                 os.remove(ID_FILE)
+        finally:
+            if os.path.exists(FIX_FLAG_FILE):
+                os.remove(FIX_FLAG_FILE)
 
     def toggle(self):
         if self.is_recording:

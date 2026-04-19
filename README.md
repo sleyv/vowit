@@ -4,7 +4,7 @@
 
   [🇷🇺 На русском](README_ru.md)
 
-  <img src="https://img.shields.io/badge/Python-3.10+-blue?style=flat&logo=python" alt="Python Version" />
+  <img src="https://img.shields.io/badge/Python-3.14-blue?style=flat&logo=python" alt="Python Version" />
   <img src="https://img.shields.io/badge/Linux-Wayland%20%7C%20X11-purple?style=flat&logo=linux" alt="Linux Desktop" />
   <img src="https://img.shields.io/badge/API-Groq%20Whisper-orange?style=flat" alt="Groq API" />
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat" alt="License" />
@@ -79,7 +79,9 @@ Run the daemon using the Python binary from your virtual environment. It will st
 ```
 
 #### 2. Bind the Shortcuts
-In your Window Manager's configuration file (e.g., `hyprland.conf`, `sway/config`), bind the following commands to your preferred keys. You can use the global system Python for this step for zero latency.
+In your Window Manager's configuration file (e.g., `hyprland.conf`, `sway/config`), bind the following commands to your preferred keys.
+
+**Important:** Because we wrote a smart "fast-path" into the script, you **do not** need to use the virtual environment binary for these shortcut commands! Using your standard system `python3` is recommended, as it bypasses loading heavy dependencies, making your push-to-talk hotkeys react instantly (zero latency).
 
 **🎤 Toggle Dictation (Microphone):**
 ```bash
@@ -96,7 +98,9 @@ python3 /path/to/vowit/main.py toggle_sys
 python3 /path/to/vowit/main.py toggle fixon
 ```
 
-Press the hotkey once to start recording (you will hear a login sound). Press it again to stop and process the audio. The transcribed text will appear in your clipboard automatically!
+*(You can append `fixon` to `toggle_sys` as well!)*
+
+Press the hotkey once to start recording (you will hear a startup sound). Press it again to stop and process the audio. The transcribed text will appear in your clipboard automatically!
 
 ---
 
