@@ -38,8 +38,8 @@
 
 #### 1. Клонирование и подготовка
 ```bash
-git clone https://github.com/sleyv/vowit.git
-cd vowit
+git clone https://github.com/sleyv/vowit.git ~/vowit
+cd ~/vowit
 ```
 
 #### 2. Установка зависимостей Python
@@ -66,27 +66,27 @@ pip install -r requirements.txt
 Приложение состоит из **фонового демона** и **CLI переключателя**.
 
 #### 1. Запуск демона
-Запустите демона, используя Python из вашего виртуального окружения.
+Запустите демона, используя Python из вашего виртуального окружения. **Вам необходимо настроить автозапуск демона при старте системы** (например, с помощью `exec-once` в конфигурации оконного менеджера или через systemd user service).
 ```bash
-/путь/к/vowit/.venv/bin/python /путь/к/vowit/main.py &
+~/vowit/.venv/bin/python ~/vowit/main.py &
 ```
 
 #### 2. Настройка горячих клавиш
-В конфигурации вашего оконного менеджера (например, `hyprland.conf`, `sway/config`), привяжите следующие команды. **Используйте обычный системный `python3`** для этих команд, чтобы обеспечить нулевую задержку!
+В конфигурации вашего оконного менеджера (например, `hyprland.conf`, `sway/config`), привяжите следующие команды к горячим клавишам. **Используйте обычный системный `python3`** для этих команд, чтобы обеспечить нулевую задержку!
 
 **🎤 Переключение диктовки (Микрофон):**
 ```bash
-python3 /путь/к/vowit/main.py toggle
+python3 ~/vowit/main.py toggle
 ```
 
 **🔊 Переключение записи системного звука:**
 ```bash
-python3 /путь/к/vowit/main.py toggle_sys
+python3 ~/vowit/main.py toggle_sys
 ```
 
 **✨ Переключение диктовки + Исправление грамматики через LLM:**
 ```bash
-python3 /путь/к/vowit/main.py toggle fixon
+python3 ~/vowit/main.py toggle fixon
 ```
 
 *(Вы также можете добавить `fixon` к команде `toggle_sys`)*

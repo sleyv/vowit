@@ -45,12 +45,50 @@ from collections import deque
 import aiohttp
 import numpy as np
 import av
+
 from dotenv import load_dotenv
 
 # Load environment variables from .env file relative to this script
 script_dir = os.path.dirname(os.path.abspath(__file__))
 env_path = os.path.join(script_dir, ".env")
 load_dotenv(env_path)
+
+UI_LANGUAGE = os.environ.get("UI_LANGUAGE", "en").lower()
+
+STRINGS = {
+    "en": {
+        "rec_mic_title": "🎙️ Recording (Microphone)",
+        "rec_mic_msg": "Speak now...",
+        "rec_sys_title": "🔊 Recording (System)",
+        "rec_sys_msg": "Capturing system audio...",
+        "processing_title": "🛑 Processing...",
+        "processing_msg": "Waiting for API response",
+        "silence_title": "🔇 Silence",
+        "silence_msg": "No voice detected",
+        "success_title": "✅ Processed",
+        "error_title": "❌ Error",
+        "error_msg": "Failed to transcribe text",
+        "sys_error_title": "❌ System Error"
+    },
+    "ru": {
+        "rec_mic_title": "🎙️ Запись (Микрофон)",
+        "rec_mic_msg": "Говорите...",
+        "rec_sys_title": "🔊 Запись (Система)",
+        "rec_sys_msg": "Захват системного звука...",
+        "processing_title": "🛑 Обработка...",
+        "processing_msg": "Ждем ответ от API",
+        "silence_title": "🔇 Тишина",
+        "silence_msg": "Голос не обнаружен",
+        "success_title": "✅ Запись обработана",
+        "error_title": "❌ Ошибка",
+        "error_msg": "Не удалось распознать текст",
+        "sys_error_title": "❌ Системная Ошибка"
+    }
+}
+
+def get_string(key):
+    lang = UI_LANGUAGE if UI_LANGUAGE in STRINGS else "en"
+    return STRINGS[lang].get(key, STRINGS["en"].get(key, key))
 
 TARGET_RMS = 0.05
 MAX_GAIN = 1.5
@@ -427,8 +465,8 @@ class AudioDaemon:
         self.is_recording = True
         self.audio_chunks = []
 
-        title = "🎙️ Запись (Микрофон)" if source == "mic" else "🔊 Запись (Система)"
-        msg = "Говорите..." if source == "mic" else "Захват системного звука..."
+        title = get_string("rec_mic_title") if source == "mic" else get_string("rec_sys_title")
+        msg = get_string("rec_mic_msg") if source == "mic" else get_string("rec_sys_msg")
 
         notif_id = send_notification(title, msg)
         if notif_id:
@@ -477,7 +515,7 @@ class AudioDaemon:
             with open(ID_FILE, "r") as f:
                 repl_id = f.read().strip()
 
-        notif_id = send_notification("🛑 Обработка...", "Ждем ответ от API", repl_id)
+        notif_id = send_notification(get_string("processing_title"), get_string("processing_msg"), repl_id)
         if notif_id:
             with open(ID_FILE, "w") as f:
                 f.write(notif_id)
@@ -518,7 +556,7 @@ class AudioDaemon:
             if "продолжение следует" in text.lower():
                 # Technically an error/silence state, play error or silence sound
                 play_sound("/usr/share/sounds/freedesktop/stereo/message.oga")
-                last_id = send_notification("🔇 Тишина", "Голос не обнаружен")
+                last_id = send_notification(get_string("silence_title"), get_string("silence_msg"))
             elif text and text != "null":
                 if os.path.exists(FIX_FLAG_FILE):
                     text = await fix_text_with_llm(text)
@@ -532,11 +570,11 @@ class AudioDaemon:
                 # Play success transcription sound
                 play_sound("/usr/share/sounds/freedesktop/stereo/message-new-instant.oga")
 
-                last_id = send_notification("✅ Запись обработана", clean_text)
+                last_id = send_notification(get_string("success_title"), clean_text)
             else:
                 # Play error sound
                 play_sound("/usr/share/sounds/freedesktop/stereo/message.oga")
-                last_id = send_notification("❌ Ошибка", "Не удалось распознать текст")
+                last_id = send_notification(get_string("error_title"), get_string("error_msg"))
 
             # Let the notification stay for 4 seconds, then close it
             await asyncio.sleep(4)
@@ -550,7 +588,7 @@ class AudioDaemon:
             if repl_id:
                 close_notification(repl_id)
             play_sound("/usr/share/sounds/freedesktop/stereo/message.oga")
-            last_id = send_notification("❌ Системная Ошибка", str(e))
+            last_id = send_notification(get_string("sys_error_title"), str(e))
             await asyncio.sleep(4)
             if last_id:
                 close_notification(last_id)

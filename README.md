@@ -38,8 +38,8 @@ Ensure your Linux system has the following dependencies:
 
 #### 1. Clone & Prepare
 ```bash
-git clone https://github.com/sleyv/vowit.git
-cd vowit
+git clone https://github.com/sleyv/vowit.git ~/vowit
+cd ~/vowit
 ```
 
 #### 2. Install Python Dependencies
@@ -66,27 +66,27 @@ You must have a **Groq API Key**.
 The application consists of a **background daemon** and a **CLI toggle tool**.
 
 #### 1. Start the Daemon
-Run the daemon using the Python binary from your virtual environment.
+Run the daemon using the Python binary from your virtual environment. **You must start this automatically when your system boots** (e.g., using `exec-once` in your window manager config or via a systemd user service).
 ```bash
-/path/to/vowit/.venv/bin/python /path/to/vowit/main.py &
+~/vowit/.venv/bin/python ~/vowit/main.py &
 ```
 
 #### 2. Bind the Shortcuts
-In your Window Manager's configuration (e.g., `hyprland.conf`, `sway/config`), bind the following commands. **Use your standard system `python3`** for these shortcut commands for zero latency!
+In your Window Manager's configuration (e.g., `hyprland.conf`, `sway/config`), bind the following commands to your preferred hotkeys/keyboard shortcuts. **Use your standard system `python3`** for these shortcut commands for zero latency!
 
 **🎤 Toggle Dictation (Microphone):**
 ```bash
-python3 /path/to/vowit/main.py toggle
+python3 ~/vowit/main.py toggle
 ```
 
 **🔊 Toggle System Audio Transcription:**
 ```bash
-python3 /path/to/vowit/main.py toggle_sys
+python3 ~/vowit/main.py toggle_sys
 ```
 
 **✨ Toggle Dictation + LLM Grammar Fix:**
 ```bash
-python3 /path/to/vowit/main.py toggle fixon
+python3 ~/vowit/main.py toggle fixon
 ```
 
 *(You can append `fixon` to `toggle_sys` as well)*
