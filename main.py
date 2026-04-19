@@ -1,16 +1,40 @@
 import os
+import sys
+import signal
+
+PID_FILE = "/tmp/groq_audio_daemon.pid"
+
+# Quick toggle path that doesn't require any third-party libraries
+if len(sys.argv) > 1 and sys.argv[1] == "toggle":
+    try:
+        with open(PID_FILE, "r") as f:
+            pid = int(f.read().strip())
+        os.kill(pid, signal.SIGUSR1)
+        print(f"Sent toggle signal to daemon (PID: {pid})")
+    except FileNotFoundError:
+        print("Daemon is not running. Start it first without arguments.")
+        sys.exit(1)
+    except ProcessLookupError:
+        print("Daemon process not found. It might have crashed. Restart it.")
+        if os.path.exists(PID_FILE):
+            os.remove(PID_FILE)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error signaling daemon: {e}")
+        sys.exit(1)
+    sys.exit(0)
+
 import asyncio
 import io
 import struct
+import logging
+import subprocess
+import json
+from collections import deque
+
 import aiohttp
 import numpy as np
 import av
-import logging
-from collections import deque
-import subprocess
-import signal
-import sys
-import json
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -278,7 +302,6 @@ async def process_audio_bytes(audio_bytes: bytes) -> tuple[str, bytes]:
         logging.error(f"Error calling Groq API: {e}")
         return "", b""
 
-PID_FILE = "/tmp/groq_audio_daemon.pid"
 ID_FILE = "/tmp/groq_notif.id"
 
 def send_notification(title, message, replaces_id=None):
@@ -487,23 +510,4 @@ async def main():
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-
-    if len(sys.argv) > 1 and sys.argv[1] == "toggle":
-        try:
-            with open(PID_FILE, "r") as f:
-                pid = int(f.read().strip())
-            os.kill(pid, signal.SIGUSR1)
-            print(f"Sent toggle signal to daemon (PID: {pid})")
-        except FileNotFoundError:
-            print("Daemon is not running. Start it first without arguments.")
-            sys.exit(1)
-        except ProcessLookupError:
-            print("Daemon process not found. It might have crashed. Restart it.")
-            if os.path.exists(PID_FILE):
-                os.remove(PID_FILE)
-            sys.exit(1)
-        except Exception as e:
-            print(f"Error signaling daemon: {e}")
-            sys.exit(1)
-    else:
-        asyncio.run(main())
+    asyncio.run(main())
