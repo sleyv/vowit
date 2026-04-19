@@ -124,6 +124,26 @@ def _make_wav(audio_float32: np.ndarray, rate: int) -> bytes:
     )
 
 
+def wav_to_ogg(wav_bytes: bytes) -> bytes:
+    """Converts a WAV byte string to an OGG OPUS byte string for Telegram Voice Notes."""
+    in_io = io.BytesIO(wav_bytes)
+    out_io = io.BytesIO()
+    try:
+        with av.open(in_io) as in_container:
+            in_stream = in_container.streams.audio[0]
+            with av.open(out_io, mode="w", format="ogg") as out_container:
+                out_stream = out_container.add_stream("libopus", rate=48000)
+                for frame in in_container.decode(in_stream):
+                    for packet in out_stream.encode(frame):
+                        out_container.mux(packet)
+                for packet in out_stream.encode(None):
+                    out_container.mux(packet)
+        return out_io.getvalue()
+    except Exception as e:
+        logging.error(f"Error converting wav to ogg: {e}")
+        return wav_bytes
+
+
 def _extract_audio_sync(audio_bytes: bytes) -> np.ndarray | None:
     """Synchronous helper to extract audio from audio bytes."""
     try:
@@ -203,7 +223,8 @@ async def process_audio_bytes(audio_bytes: bytes) -> tuple[str, bytes]:
         logging.info("Audio too short after VAD processing.")
         return "", b""
 
-    file_data = _make_wav(audio_np, 16000)
+    wav_file_data = _make_wav(audio_np, 16000)
+    file_data = wav_to_ogg(wav_file_data)
 
     # Replaced config with env vars as requested.
     groq_api_key = os.environ.get("GROQ_API_KEY", "")
@@ -222,8 +243,8 @@ async def process_audio_bytes(audio_bytes: bytes) -> tuple[str, bytes]:
     data.add_field(
         "file",
         file_data,
-        filename="processed_audio.wav",
-        content_type="audio/wav",
+        filename="processed_audio.ogg",
+        content_type="audio/ogg",
     )
 
     try:
