@@ -1,0 +1,5 @@
+numpy
+aiohttp
+onnxruntime
+av
+python-dotenv
