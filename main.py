@@ -11,6 +11,10 @@ import subprocess
 import signal
 import sys
 import json
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 TARGET_RMS = 0.05
 MAX_GAIN = 1.5
@@ -267,7 +271,7 @@ async def process_audio_bytes(audio_bytes: bytes) -> tuple[str, bytes]:
         logging.error(f"Error calling Groq API: {e}")
         return "", b""
 
-PID_FILE = "/tmp/groq_audio.pid"
+PID_FILE = "/tmp/groq_audio_daemon.pid"
 ID_FILE = "/tmp/groq_notif.id"
 
 def send_notification(title, message, replaces_id=None):
@@ -291,84 +295,60 @@ def close_notification(notif_id):
     ]
     subprocess.run(cmd, stderr=subprocess.DEVNULL)
 
-async def main():
-    # If already running, toggle off
-    if os.path.exists(PID_FILE):
-        try:
-            with open(PID_FILE, "r") as f:
-                pid = int(f.read().strip())
+class AudioDaemon:
+    def __init__(self):
+        self.is_recording = False
+        self.process = None
+        self.audio_chunks = []
+        self.read_task = None
+        self.processing_task = None
 
-            # Send SIGINT to the running process
-            os.kill(pid, signal.SIGINT)
-
-            # Update notification to Processing
-            repl_id = None
-            if os.path.exists(ID_FILE):
-                with open(ID_FILE, "r") as f:
-                    repl_id = f.read().strip()
-
-            notif_id = send_notification("🛑 Обработка...", "Ждем ответ от API", repl_id)
-            if notif_id:
-                with open(ID_FILE, "w") as f:
-                    f.write(notif_id)
-
-            return # Exit this instance
-        except ProcessLookupError:
-            # Process was not running, cleanup and continue
-            os.remove(PID_FILE)
-        except Exception as e:
-            logging.error(f"Error checking PID: {e}")
-            pass
-
-    # Start new recording instance
-    with open(PID_FILE, "w") as f:
-        f.write(str(os.getpid()))
-
-    notif_id = send_notification("🎙️ Запись", "Говорите...")
-    if notif_id:
-        with open(ID_FILE, "w") as f:
-            f.write(notif_id)
-
-    # Play start sound
-    subprocess.Popen(
-        ["paplay", "/usr/share/sounds/freedesktop/stereo/service-login.oga"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
-
-    ffmpeg_cmd = [
-        "ffmpeg", "-v", "quiet", "-f", "pulse", "-i", "default",
-        "-metadata", "title=groq_audio", "-ac", "1", "-ar", "16000",
-        "-c:a", "libopus", "-f", "ogg", "-"
-    ]
-
-    process = await asyncio.create_subprocess_exec(
-        *ffmpeg_cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL
-    )
-
-    stop_recording = asyncio.Event()
-
-    def signal_handler(sig, frame):
-        stop_recording.set()
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    audio_chunks = []
-
-    async def read_stdout():
-        while not process.stdout.at_eof():
-            chunk = await process.stdout.read(4096)
+    async def _read_stdout(self):
+        while self.process and not self.process.stdout.at_eof():
+            chunk = await self.process.stdout.read(4096)
             if chunk:
-                audio_chunks.append(chunk)
+                self.audio_chunks.append(chunk)
 
-    read_task = asyncio.create_task(read_stdout())
+    def start_recording(self):
+        if self.is_recording:
+            return
 
-    try:
-        while not stop_recording.is_set():
-            await asyncio.sleep(0.1)
+        self.is_recording = True
+        self.audio_chunks = []
+
+        notif_id = send_notification("🎙️ Запись", "Говорите...")
+        if notif_id:
+            with open(ID_FILE, "w") as f:
+                f.write(notif_id)
+
+        # Play start sound
+        subprocess.Popen(
+            ["paplay", "/usr/share/sounds/freedesktop/stereo/service-login.oga"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+
+        ffmpeg_cmd = [
+            "ffmpeg", "-v", "quiet", "-f", "pulse", "-i", "default",
+            "-metadata", "title=groq_audio", "-ac", "1", "-ar", "16000",
+            "-c:a", "libopus", "-f", "ogg", "-"
+        ]
+
+        asyncio.create_task(self._start_ffmpeg(ffmpeg_cmd))
+
+    async def _start_ffmpeg(self, ffmpeg_cmd):
+        self.process = await asyncio.create_subprocess_exec(
+            *ffmpeg_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        self.read_task = asyncio.create_task(self._read_stdout())
+
+    def stop_recording(self):
+        if not self.is_recording:
+            return
+
+        self.is_recording = False
 
         # Play end sound
         subprocess.Popen(
@@ -377,48 +357,101 @@ async def main():
             stderr=subprocess.DEVNULL
         )
 
-        process.terminate()
-        await read_task
-    finally:
-        if process.returncode is None:
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
-        await process.wait()
+        repl_id = None
+        if os.path.exists(ID_FILE):
+            with open(ID_FILE, "r") as f:
+                repl_id = f.read().strip()
 
-        # Audio collected, we can remove the PID file to allow a new recording to start
+        notif_id = send_notification("🛑 Обработка...", "Ждем ответ от API", repl_id)
+        if notif_id:
+            with open(ID_FILE, "w") as f:
+                f.write(notif_id)
+
+        if self.process:
+            self.process.terminate()
+
+        # We schedule processing in background
+        self.processing_task = asyncio.create_task(self._process_collected_audio())
+
+    async def _process_collected_audio(self):
+        if self.read_task:
+            await self.read_task
+
+        if self.process:
+            if self.process.returncode is None:
+                try:
+                    self.process.kill()
+                except ProcessLookupError:
+                    pass
+            await self.process.wait()
+
+        audio_bytes = b"".join(self.audio_chunks)
+
+        repl_id = None
+        if os.path.exists(ID_FILE):
+            with open(ID_FILE, "r") as f:
+                repl_id = f.read().strip()
+
+        text, _ = await process_audio_bytes(audio_bytes)
+
+        last_id = None
+        if "продолжение следует" in text.lower():
+            last_id = send_notification("🔇 Тишина", "Голос не обнаружен", repl_id)
+        elif text and text != "null":
+            subprocess.run(["wl-copy"], input=text, text=True)
+            clean_text = " ".join(text.splitlines())[:40]
+            if len(text) > 40:
+                clean_text += "..."
+            last_id = send_notification("✅ Запись обработана", clean_text, repl_id)
+        else:
+            last_id = send_notification("❌ Ошибка", "Не удалось распознать текст", repl_id)
+
+        # Let the notification stay for 4 seconds, then close it
+        await asyncio.sleep(4)
+        if last_id:
+            close_notification(last_id)
+
+        if os.path.exists(ID_FILE):
+            os.remove(ID_FILE)
+
+    def toggle(self):
+        if self.is_recording:
+            self.stop_recording()
+        else:
+            self.start_recording()
+
+async def main():
+    # Write PID so we can signal this process
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+    daemon = AudioDaemon()
+    loop = asyncio.get_running_loop()
+
+    # Bind toggle to SIGUSR1
+    loop.add_signal_handler(signal.SIGUSR1, daemon.toggle)
+
+    stop_event = asyncio.Event()
+
+    # Graceful shutdown on SIGINT/SIGTERM
+    def shutdown():
+        stop_event.set()
+
+    loop.add_signal_handler(signal.SIGINT, shutdown)
+    loop.add_signal_handler(signal.SIGTERM, shutdown)
+
+    logging.info(f"Daemon started with PID {os.getpid()}. Waiting for SIGUSR1 to toggle recording.")
+
+    try:
+        await stop_event.wait()
+    finally:
+        if daemon.is_recording:
+            daemon.stop_recording()
+            if daemon.processing_task:
+                await daemon.processing_task
         if os.path.exists(PID_FILE):
             os.remove(PID_FILE)
 
-    audio_bytes = b"".join(audio_chunks)
-
-    # Audio collected, process it
-    repl_id = None
-    if os.path.exists(ID_FILE):
-        with open(ID_FILE, "r") as f:
-            repl_id = f.read().strip()
-
-    text, _ = await process_audio_bytes(audio_bytes)
-
-    last_id = None
-    if "продолжение следует" in text.lower():
-        last_id = send_notification("🔇 Тишина", "Голос не обнаружен", repl_id)
-    elif text and text != "null":
-        subprocess.run(["wl-copy"], input=text, text=True)
-        clean_text = " ".join(text.splitlines())[:40]
-        if len(text) > 40:
-            clean_text += "..."
-        last_id = send_notification("✅ Запись обработана", clean_text, repl_id)
-    else:
-        last_id = send_notification("❌ Ошибка", "Не удалось распознать текст", repl_id)
-
-    await asyncio.sleep(4)
-    if last_id:
-        close_notification(last_id)
-
-    if os.path.exists(ID_FILE):
-        os.remove(ID_FILE)
-
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
