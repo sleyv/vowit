@@ -56,8 +56,8 @@ You must have a **Groq API Key**.
 2. Create a `.env` file from the provided template:
    ```bash
    cp .env.example .env
-   # Edit .env and paste your GROQ_API_KEY
    ```
+3. Edit the `.env` file and paste your `GROQ_API_KEY`. There are also other interesting settings you can explore and customize, such as UI language and Whisper model!
 
 ---
 
