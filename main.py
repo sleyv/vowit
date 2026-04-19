@@ -173,19 +173,8 @@ def _extract_audio_sync(audio_bytes: bytes) -> np.ndarray | None:
         logging.error(f"Failed to decode audio bytes: {e}")
         return None
 
-async def process_audio_bytes(audio_bytes: bytes) -> tuple[str, bytes]:
-    """
-    Reads input audio bytes, applies denoise, VAD, gain,
-    outputs (final text, processed wav bytes) from Groq Whisper.
-    """
-    if not audio_bytes or len(audio_bytes) < 100:
-        logging.info("Audio too small or empty.")
-        return "", b""
-
-    raw_audio = await asyncio.to_thread(_extract_audio_sync, audio_bytes)
-    if raw_audio is None:
-        return "", b""
-
+def _apply_vad_and_limit_sync(raw_audio: np.ndarray) -> bytes | None:
+    """Synchronous CPU-bound function to apply TrueRMS and VAD, returning OGG bytes."""
     session = get_vad_session()
     vad = ONNXVAD(session) if session is not None else None
     limiter = TrueRMSLimiter(target_rms=TARGET_RMS, max_gain=MAX_GAIN)
@@ -220,15 +209,33 @@ async def process_audio_bytes(audio_bytes: bytes) -> tuple[str, bytes]:
 
     if not buffer:
         logging.info("No speech detected in input.")
-        return "", b""
+        return None
 
     audio_np = np.concatenate(buffer)
     if len(audio_np) < RATE_WHISPER * 0.5:
         logging.info("Audio too short after VAD processing.")
-        return "", b""
+        return None
 
     wav_file_data = _make_wav(audio_np, 16000)
-    file_data = wav_to_ogg(wav_file_data)
+    return wav_to_ogg(wav_file_data)
+
+
+async def process_audio_bytes(audio_bytes: bytes) -> tuple[str, bytes]:
+    """
+    Reads input audio bytes, applies denoise, VAD, gain,
+    outputs (final text, processed wav bytes) from Groq Whisper.
+    """
+    if not audio_bytes or len(audio_bytes) < 100:
+        logging.info("Audio too small or empty.")
+        return "", b""
+
+    raw_audio = await asyncio.to_thread(_extract_audio_sync, audio_bytes)
+    if raw_audio is None:
+        return "", b""
+
+    file_data = await asyncio.to_thread(_apply_vad_and_limit_sync, raw_audio)
+    if file_data is None:
+        return "", b""
 
     # Replaced config with env vars as requested.
     groq_api_key = os.environ.get("GROQ_API_KEY", "")
@@ -302,6 +309,14 @@ class AudioDaemon:
         self.audio_chunks = []
         self.read_task = None
         self.processing_task = None
+        self.timeout_task = None
+
+    async def _recording_timeout(self):
+        # Wait for 10 minutes (600 seconds)
+        await asyncio.sleep(600)
+        if self.is_recording:
+            logging.info("10-minute recording limit reached. Automatically stopping.")
+            self.stop_recording()
 
     async def _read_stdout(self):
         while self.process and not self.process.stdout.at_eof():
@@ -337,6 +352,9 @@ class AudioDaemon:
 
         asyncio.create_task(self._start_ffmpeg(ffmpeg_cmd))
 
+        # Start the 10-minute timeout task
+        self.timeout_task = asyncio.create_task(self._recording_timeout())
+
     async def _start_ffmpeg(self, ffmpeg_cmd):
         self.process = await asyncio.create_subprocess_exec(
             *ffmpeg_cmd,
@@ -351,6 +369,9 @@ class AudioDaemon:
             return
 
         self.is_recording = False
+
+        if self.timeout_task and not self.timeout_task.done():
+            self.timeout_task.cancel()
 
         # Play end sound
         subprocess.Popen(
@@ -377,45 +398,54 @@ class AudioDaemon:
         self.processing_task = asyncio.create_task(self._process_collected_audio())
 
     async def _process_collected_audio(self):
-        if self.read_task:
-            await self.read_task
-
-        if self.process:
-            if self.process.returncode is None:
-                try:
-                    self.process.kill()
-                except ProcessLookupError:
-                    pass
-            await self.process.wait()
-
-        audio_bytes = b"".join(self.audio_chunks)
-
         repl_id = None
         if os.path.exists(ID_FILE):
             with open(ID_FILE, "r") as f:
                 repl_id = f.read().strip()
 
-        text, _ = await process_audio_bytes(audio_bytes)
+        try:
+            if self.read_task:
+                await self.read_task
 
-        last_id = None
-        if "продолжение следует" in text.lower():
-            last_id = send_notification("🔇 Тишина", "Голос не обнаружен", repl_id)
-        elif text and text != "null":
-            subprocess.run(["wl-copy"], input=text, text=True)
-            clean_text = " ".join(text.splitlines())[:40]
-            if len(text) > 40:
-                clean_text += "..."
-            last_id = send_notification("✅ Запись обработана", clean_text, repl_id)
-        else:
-            last_id = send_notification("❌ Ошибка", "Не удалось распознать текст", repl_id)
+            if self.process:
+                if self.process.returncode is None:
+                    try:
+                        self.process.kill()
+                    except ProcessLookupError:
+                        pass
+                await self.process.wait()
 
-        # Let the notification stay for 4 seconds, then close it
-        await asyncio.sleep(4)
-        if last_id:
-            close_notification(last_id)
+            audio_bytes = b"".join(self.audio_chunks)
 
-        if os.path.exists(ID_FILE):
-            os.remove(ID_FILE)
+            text, _ = await process_audio_bytes(audio_bytes)
+
+            last_id = None
+            if "продолжение следует" in text.lower():
+                last_id = send_notification("🔇 Тишина", "Голос не обнаружен", repl_id)
+            elif text and text != "null":
+                subprocess.run(["wl-copy"], input=text, text=True)
+                clean_text = " ".join(text.splitlines())[:40]
+                if len(text) > 40:
+                    clean_text += "..."
+                last_id = send_notification("✅ Запись обработана", clean_text, repl_id)
+            else:
+                last_id = send_notification("❌ Ошибка", "Не удалось распознать текст", repl_id)
+
+            # Let the notification stay for 4 seconds, then close it
+            await asyncio.sleep(4)
+            if last_id:
+                close_notification(last_id)
+
+            if os.path.exists(ID_FILE):
+                os.remove(ID_FILE)
+        except Exception as e:
+            logging.error(f"Error during audio processing: {e}")
+            last_id = send_notification("❌ Системная Ошибка", str(e), repl_id)
+            await asyncio.sleep(4)
+            if last_id:
+                close_notification(last_id)
+            if os.path.exists(ID_FILE):
+                os.remove(ID_FILE)
 
     def toggle(self):
         if self.is_recording:
