@@ -60,9 +60,11 @@ pip install -r requirements.txt
 ```
 
 #### 3. Setup Environment Variables
-Create a `.env` file from the provided template and insert your Groq API key:
-```bash
-cp .env.example .env
+To use this tool, you must have a **Groq API Key**. It's free.
+1. Go to the [Groq Cloud Console](https://console.groq.com/keys) and generate a new API key.
+2. Create a `.env` file from the provided template:
+   ```bash
+   cp .env.example .env
 # Edit .env and paste your GROQ_API_KEY
 ```
 
