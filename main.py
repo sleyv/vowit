@@ -453,11 +453,15 @@ class AudioDaemon:
 
             text, _ = await process_audio_bytes(audio_bytes)
 
+            # Close the "Processing..." notification explicitly so the next one pops up as a fresh notification
+            if repl_id:
+                close_notification(repl_id)
+
             last_id = None
             if "продолжение следует" in text.lower():
                 # Technically an error/silence state, play error or silence sound
                 subprocess.Popen(["paplay", "/usr/share/sounds/freedesktop/stereo/dialog-error.oga"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                last_id = send_notification("🔇 Тишина", "Голос не обнаружен", repl_id)
+                last_id = send_notification("🔇 Тишина", "Голос не обнаружен")
             elif text and text != "null":
                 subprocess.run(["wl-copy"], input=text, text=True)
                 clean_text = " ".join(text.splitlines())[:40]
@@ -465,13 +469,13 @@ class AudioDaemon:
                     clean_text += "..."
 
                 # Play success transcription sound
-                subprocess.Popen(["paplay", "/usr/share/sounds/freedesktop/stereo/complete.oga"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.Popen(["paplay", "/usr/share/sounds/freedesktop/stereo/message.oga"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-                last_id = send_notification("✅ Запись обработана", clean_text, repl_id)
+                last_id = send_notification("✅ Запись обработана", clean_text)
             else:
                 # Play error sound
                 subprocess.Popen(["paplay", "/usr/share/sounds/freedesktop/stereo/dialog-error.oga"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                last_id = send_notification("❌ Ошибка", "Не удалось распознать текст", repl_id)
+                last_id = send_notification("❌ Ошибка", "Не удалось распознать текст")
 
             # Let the notification stay for 4 seconds, then close it
             await asyncio.sleep(4)
@@ -482,8 +486,10 @@ class AudioDaemon:
                 os.remove(ID_FILE)
         except Exception as e:
             logging.error(f"Error during audio processing: {e}")
+            if repl_id:
+                close_notification(repl_id)
             subprocess.Popen(["paplay", "/usr/share/sounds/freedesktop/stereo/dialog-error.oga"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            last_id = send_notification("❌ Системная Ошибка", str(e), repl_id)
+            last_id = send_notification("❌ Системная Ошибка", str(e))
             await asyncio.sleep(4)
             if last_id:
                 close_notification(last_id)
