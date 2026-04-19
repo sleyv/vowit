@@ -329,6 +329,13 @@ async def main():
         with open(ID_FILE, "w") as f:
             f.write(notif_id)
 
+    # Play start sound
+    subprocess.Popen(
+        ["paplay", "/usr/share/sounds/freedesktop/stereo/service-login.oga"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+
     ffmpeg_cmd = [
         "ffmpeg", "-v", "quiet", "-f", "pulse", "-i", "default",
         "-metadata", "title=groq_audio", "-ac", "1", "-ar", "16000",
@@ -362,6 +369,13 @@ async def main():
     try:
         while not stop_recording.is_set():
             await asyncio.sleep(0.1)
+
+        # Play end sound
+        subprocess.Popen(
+            ["paplay", "/usr/share/sounds/freedesktop/stereo/service-logout.oga"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
 
         process.terminate()
         await read_task
