@@ -4,8 +4,13 @@ import signal
 
 PID_FILE = "/tmp/groq_audio_daemon.pid"
 
+FIX_FLAG_FILE = "/tmp/groq_audio_fixon.flag"
+
 # Quick toggle path that doesn't require any third-party libraries
 if len(sys.argv) > 1 and sys.argv[1] in ("toggle", "toggle_sys"):
+    if "fixon" in sys.argv:
+        open(FIX_FLAG_FILE, "w").close()
+
     try:
         with open(PID_FILE, "r") as f:
             pid = int(f.read().strip())
@@ -250,6 +255,54 @@ def _apply_vad_and_limit_sync(raw_audio: np.ndarray) -> bytes | None:
     return wav_to_ogg(wav_file_data)
 
 
+async def fix_text_with_llm(text: str) -> str:
+    """Uses Groq's LLM to slightly fix grammar and add paragraphs to the transcribed text."""
+    groq_api_key = os.environ.get("GROQ_API_KEY", "")
+    if not groq_api_key:
+        return text
+
+    headers = {
+        "Authorization": f"Bearer {groq_api_key}",
+        "Content-Type": "application/json"
+    }
+
+    # The user asked for "openai/gpt-oss-120b" but Groq's standard models have specific IDs.
+    # Let's use llama-3.1-70b-versatile or let the user override via env var, falling back to a known Groq model
+    model = os.environ.get("LLM_MODEL", "llama-3.1-70b-versatile")
+
+    system_prompt = (
+        "Your task is to slightly fix grammar and divide the text into paragraphs. "
+        "Make minimal changes. Do not remake the text fully. Respond ONLY with the fixed text."
+    )
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text}
+        ],
+        "temperature": 0.2
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session_http:
+            async with session_http.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            ) as resp:
+                if resp.status != 200:
+                    err = await resp.text()
+                    logging.error(f"Groq LLM API Error {resp.status}: {err}")
+                    return text
+                json_resp = await resp.json()
+                fixed_text = json_resp.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                return fixed_text if fixed_text else text
+    except Exception as e:
+        logging.error(f"Error calling Groq LLM API: {e}")
+        return text
+
+
 async def process_audio_bytes(audio_bytes: bytes) -> tuple[str, bytes]:
     """
     Reads input audio bytes, applies denoise, VAD, gain,
@@ -463,13 +516,17 @@ class AudioDaemon:
                 subprocess.Popen(["paplay", "/usr/share/sounds/freedesktop/stereo/dialog-error.oga"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 last_id = send_notification("🔇 Тишина", "Голос не обнаружен")
             elif text and text != "null":
+                if os.path.exists(FIX_FLAG_FILE):
+                    text = await fix_text_with_llm(text)
+                    os.remove(FIX_FLAG_FILE)
+
                 subprocess.run(["wl-copy"], input=text, text=True)
                 clean_text = " ".join(text.splitlines())[:40]
                 if len(text) > 40:
                     clean_text += "..."
 
                 # Play success transcription sound
-                subprocess.Popen(["paplay", "/usr/share/sounds/freedesktop/stereo/message.oga"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.Popen(["paplay", "/usr/share/sounds/freedesktop/stereo/message-new-instant.oga"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
                 last_id = send_notification("✅ Запись обработана", clean_text)
             else:
