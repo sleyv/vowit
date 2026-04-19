@@ -324,12 +324,13 @@ class AudioDaemon:
         # Play start sound
         subprocess.Popen(
             ["paplay", "/usr/share/sounds/freedesktop/stereo/service-login.oga"],
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
 
         ffmpeg_cmd = [
-            "ffmpeg", "-v", "quiet", "-f", "pulse", "-i", "default",
+            "ffmpeg", "-nostdin", "-v", "quiet", "-f", "pulse", "-i", "default",
             "-metadata", "title=groq_audio", "-ac", "1", "-ar", "16000",
             "-c:a", "libopus", "-f", "ogg", "-"
         ]
@@ -339,6 +340,7 @@ class AudioDaemon:
     async def _start_ffmpeg(self, ffmpeg_cmd):
         self.process = await asyncio.create_subprocess_exec(
             *ffmpeg_cmd,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL
         )
@@ -353,6 +355,7 @@ class AudioDaemon:
         # Play end sound
         subprocess.Popen(
             ["paplay", "/usr/share/sounds/freedesktop/stereo/service-logout.oga"],
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
