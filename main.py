@@ -266,9 +266,10 @@ async def fix_text_with_llm(text: str) -> str:
         "Content-Type": "application/json"
     }
 
-    # The user asked for "openai/gpt-oss-120b" but Groq's standard models have specific IDs.
-    # Let's use llama-3.1-70b-versatile or let the user override via env var, falling back to a known Groq model
-    model = os.environ.get("LLM_MODEL", "llama-3.1-70b-versatile")
+    # Use the model the user requested explicitly.
+    model = os.environ.get("LLM_MODEL", "openai/gpt-oss-120b")
+    # Allow overriding the base URL in case they use OpenRouter or another provider for the LLM fix
+    llm_base_url = os.environ.get("LLM_BASE_URL", "https://api.groq.com/openai/v1/chat/completions")
 
     system_prompt = (
         "Your task is to slightly fix grammar and divide the text into paragraphs. "
@@ -287,13 +288,13 @@ async def fix_text_with_llm(text: str) -> str:
     try:
         async with aiohttp.ClientSession() as session_http:
             async with session_http.post(
-                "https://api.groq.com/openai/v1/chat/completions",
+                llm_base_url,
                 headers=headers,
                 json=payload,
             ) as resp:
                 if resp.status != 200:
                     err = await resp.text()
-                    logging.error(f"Groq LLM API Error {resp.status}: {err}")
+                    logging.error(f"LLM API Error {resp.status}: {err}")
                     return text
                 json_resp = await resp.json()
                 fixed_text = json_resp.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
@@ -363,6 +364,16 @@ async def process_audio_bytes(audio_bytes: bytes) -> tuple[str, bytes]:
 
 ID_FILE = "/tmp/groq_notif.id"
 
+def play_sound(sound_path):
+    """Plays a sound using paplay, killing any existing paplay instances to prevent overlap issues."""
+    subprocess.run(["pkill", "-x", "paplay"], stderr=subprocess.DEVNULL)
+    subprocess.Popen(
+        ["paplay", sound_path],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+
 def send_notification(title, message, replaces_id=None):
     cmd = ["notify-send", "-p"]
     if replaces_id:
@@ -422,12 +433,7 @@ class AudioDaemon:
                 f.write(notif_id)
 
         # Play start sound
-        subprocess.Popen(
-            ["paplay", "/usr/share/sounds/freedesktop/stereo/service-login.oga"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
+        play_sound("/usr/share/sounds/freedesktop/stereo/service-login.oga")
 
         input_device = "default" if source == "mic" else "@DEFAULT_SINK@.monitor"
 
@@ -461,12 +467,7 @@ class AudioDaemon:
             self.timeout_task.cancel()
 
         # Play end sound
-        subprocess.Popen(
-            ["paplay", "/usr/share/sounds/freedesktop/stereo/service-logout.oga"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
+        play_sound("/usr/share/sounds/freedesktop/stereo/service-logout.oga")
 
         repl_id = None
         if os.path.exists(ID_FILE):
@@ -513,7 +514,7 @@ class AudioDaemon:
             last_id = None
             if "продолжение следует" in text.lower():
                 # Technically an error/silence state, play error or silence sound
-                subprocess.Popen(["paplay", "/usr/share/sounds/freedesktop/stereo/dialog-error.oga"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                play_sound("/usr/share/sounds/freedesktop/stereo/dialog-error.oga")
                 last_id = send_notification("🔇 Тишина", "Голос не обнаружен")
             elif text and text != "null":
                 if os.path.exists(FIX_FLAG_FILE):
@@ -526,12 +527,12 @@ class AudioDaemon:
                     clean_text += "..."
 
                 # Play success transcription sound
-                subprocess.Popen(["paplay", "/usr/share/sounds/freedesktop/stereo/message-new-instant.oga"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                play_sound("/usr/share/sounds/freedesktop/stereo/message-new-instant.oga")
 
                 last_id = send_notification("✅ Запись обработана", clean_text)
             else:
                 # Play error sound
-                subprocess.Popen(["paplay", "/usr/share/sounds/freedesktop/stereo/dialog-error.oga"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                play_sound("/usr/share/sounds/freedesktop/stereo/dialog-error.oga")
                 last_id = send_notification("❌ Ошибка", "Не удалось распознать текст")
 
             # Let the notification stay for 4 seconds, then close it
@@ -545,7 +546,7 @@ class AudioDaemon:
             logging.error(f"Error during audio processing: {e}")
             if repl_id:
                 close_notification(repl_id)
-            subprocess.Popen(["paplay", "/usr/share/sounds/freedesktop/stereo/dialog-error.oga"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            play_sound("/usr/share/sounds/freedesktop/stereo/dialog-error.oga")
             last_id = send_notification("❌ Системная Ошибка", str(e))
             await asyncio.sleep(4)
             if last_id:
