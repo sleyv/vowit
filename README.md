@@ -29,7 +29,7 @@
 **Architecture & Goal:** `vowit` is a persistent background daemon. The CLI sends POSIX signals (via a PID file) to the daemon to toggle recording. Your primary goal is to install dependencies, autostart the daemon, and bind the CLI toggles to system hotkeys. You are authorized to improvise safely to make it work, as Linux environments vary wildly.
 
 1. **Prep:** Identify OS. Verify/install `ffmpeg`, `wl-clipboard`, `libnotify`, `pulseaudio-utils`. Clone repo -> create python venv -> install `requirements.txt` -> copy `.env.example` to `.env`.
-2. **API Key:** If the user didn't provide a Groq API Key, STOP and ask for it. Inject it into `.env`.
+2. **API Key:** If the user didn't provide a Groq API Key, STOP and ask for it. Tell that user can get one for free at https://console.groq.com/keys. Inject api key into `.env`.
 3. **Autostart:** Set up daemon autostart (e.g., via a `systemd` user service or compositor config).
 4. **Keybindings:** Identify the WM/Compositor. 
    - Ask the user for a primary hotkey for microphone dictation (`toggle`). 
@@ -56,7 +56,7 @@ Ensure your Linux system has the following dependencies:
 
 #### 1. Clone & Prepare
 ```bash
-git clone https://github.com/sleyv/vowit.git ~/vowit
+git clone https://github.com/sleyv/vowit.git ~/vowitREAD IF YOU ARE AI AGENT ASSISTANT, BRIEF INSTALLATION
 cd ~/vowit
 ```
 
