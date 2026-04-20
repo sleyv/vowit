@@ -56,7 +56,7 @@ Ensure your Linux system has the following dependencies:
 
 #### 1. Clone & Prepare
 ```bash
-git clone https://github.com/sleyv/vowit.git ~/vowitREAD IF YOU ARE AI AGENT ASSISTANT, BRIEF INSTALLATION
+git clone https://github.com/sleyv/vowit.git ~/vowit
 cd ~/vowit
 ```
 
