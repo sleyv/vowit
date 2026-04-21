@@ -275,7 +275,7 @@ async def fix_text_with_llm(text: str) -> str:
         return text
 
 
-async def process_ready_audio(file_data: bytes) -> tuple[str, bytes]:
+async def process_ready_audio(file_data: bytes, prompt: str = "") -> tuple[str, bytes]:
     """
     Sends the pre-processed audio bytes to Groq Whisper.
     """
@@ -295,6 +295,9 @@ async def process_ready_audio(file_data: bytes) -> tuple[str, bytes]:
     if bot_language:
         # Pass language hint to Whisper (ISO-639-1)
         data.add_field("language", bot_language.lower()[:2])
+
+    if prompt:
+        data.add_field("prompt", prompt)
 
     data.add_field(
         "file",
@@ -374,6 +377,10 @@ class AudioDaemon:
         self.state_speech = False
         self.chunk_remainder = b""
 
+        # Chunking/Streaming state
+        self.transcription_queue = None
+        self.worker_task = None
+
     async def _recording_timeout(self):
         # Wait for 10 minutes (600 seconds)
         await asyncio.sleep(600)
@@ -414,6 +421,15 @@ class AudioDaemon:
                         if res == "end":
                             self.state_speech = False
                             self.history_q.clear()
+
+                            # Check if we should dispatch a chunk (>= 10 seconds of speech)
+                            buffer_len_seconds = (len(self.speech_buffer) * CHUNK_VAD_16K) / RATE_WHISPER
+                            if buffer_len_seconds >= 10.0:
+                                chunk_to_send = list(self.speech_buffer)
+                                self.speech_buffer.clear()
+                                # Only queue it if the queue exists and we're recording
+                                if self.transcription_queue is not None:
+                                    self.transcription_queue.put_nowait(chunk_to_send)
                 else:
                     self.speech_buffer.append(c16)
 
@@ -431,6 +447,9 @@ class AudioDaemon:
         self.history_q = deque(maxlen=15)
         self.state_speech = False
         self.chunk_remainder = b""
+
+        self.transcription_queue = asyncio.Queue()
+        self.full_transcription = []
 
         title = get_string("rec_mic_title") if source == "mic" else get_string("rec_sys_title")
         msg = get_string("rec_mic_msg") if source == "mic" else get_string("rec_sys_msg")
@@ -455,6 +474,34 @@ class AudioDaemon:
 
         # Start the 10-minute timeout task
         self.timeout_task = asyncio.create_task(self._recording_timeout())
+
+        # Start transcription worker
+        self.worker_task = asyncio.create_task(self._transcription_worker())
+
+    async def _transcription_worker(self):
+        prompt = ""
+        while True:
+            chunk = await self.transcription_queue.get()
+            if chunk is None:  # EOF marker
+                self.transcription_queue.task_done()
+                break
+
+            audio_np = np.concatenate(chunk)
+            if len(audio_np) >= RATE_WHISPER * 0.5:
+                wav_file_data = _make_wav(audio_np, 16000)
+                ogg_data = wav_to_ogg(wav_file_data)
+
+                # Send to API
+                text, _ = await process_ready_audio(ogg_data, prompt=prompt)
+
+                if text and text != "null" and "продолжение следует" not in text.lower():
+                    self.full_transcription.append(text)
+
+                    # Update prompt with the last ~10-15 words
+                    words = text.split()
+                    prompt = " ".join(words[-15:]) if len(words) > 15 else text
+
+            self.transcription_queue.task_done()
 
     async def _start_ffmpeg(self, ffmpeg_cmd):
         self.process = await asyncio.create_subprocess_exec(
@@ -511,29 +558,29 @@ class AudioDaemon:
                         pass
                 await self.process.wait()
 
-            if not self.speech_buffer:
-                logging.info("No speech detected during recording.")
-                text = ""
-            else:
-                audio_np = np.concatenate(self.speech_buffer)
-                if len(audio_np) < RATE_WHISPER * 0.5:
-                    logging.info("Speech audio too short.")
-                    text = ""
-                else:
-                    wav_file_data = _make_wav(audio_np, 16000)
-                    ogg_data = wav_to_ogg(wav_file_data)
-                    text, _ = await process_ready_audio(ogg_data)
+            # Flush remaining audio
+            if self.speech_buffer and self.transcription_queue is not None:
+                self.transcription_queue.put_nowait(list(self.speech_buffer))
+                self.speech_buffer.clear()
+
+            # Send EOF and wait for worker to finish
+            if self.transcription_queue is not None:
+                self.transcription_queue.put_nowait(None)
+
+            if self.worker_task is not None:
+                await self.worker_task
+                self.worker_task = None
+                self.transcription_queue = None
 
             # Close the "Processing..." notification explicitly so the next one pops up as a fresh notification
             if repl_id:
                 close_notification(repl_id)
 
             last_id = None
-            if "продолжение следует" in text.lower():
-                # Technically an error/silence state, play error or silence sound
-                play_sound("/usr/share/sounds/freedesktop/stereo/message.oga")
-                last_id = send_notification(get_string("silence_title"), get_string("silence_msg"))
-            elif text and text != "null":
+
+            text = " ".join(self.full_transcription).strip()
+
+            if text and text != "null":
                 if os.path.exists(FIX_FLAG_FILE):
                     text = await fix_text_with_llm(text)
                     os.remove(FIX_FLAG_FILE)
@@ -548,9 +595,12 @@ class AudioDaemon:
 
                 last_id = send_notification(get_string("success_title"), clean_text)
             else:
-                # Play error sound
+                # Play error sound/silence sound
                 play_sound("/usr/share/sounds/freedesktop/stereo/message.oga")
-                last_id = send_notification(get_string("error_title"), get_string("error_msg"))
+                if not self.full_transcription:
+                    last_id = send_notification(get_string("silence_title"), get_string("silence_msg"))
+                else:
+                    last_id = send_notification(get_string("error_title"), get_string("error_msg"))
 
             # Let the notification stay for 4 seconds, then close it
             await asyncio.sleep(4)
