@@ -51,10 +51,8 @@ def check_api_key_and_get_models(api_key):
         with urllib.request.urlopen(req) as resp:
             data = json.loads(resp.read().decode('utf-8'))
             models = [m['id'] for m in data.get('data', []) if 'whisper' not in m['id']]
-            # Keep common text models to avoid cluttering UI with legacy ones
-            models = [m for m in models if 'llama' in m or 'gemma' in m or 'mixtral' in m]
 
-            # The custom model user mentioned earlier isn't a standard Groq ID, but they use OpenRouter locally for it.
+            # Ensure the custom model from previous steps is included if user relies on OpenRouter locally
             if "openai/gpt-oss-120b" not in models:
                 models.append("openai/gpt-oss-120b")
 
