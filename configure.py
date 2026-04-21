@@ -1,4 +1,6 @@
 import os
+import urllib.request
+import urllib.error
 import questionary
 
 LANGUAGES = {
@@ -33,22 +35,62 @@ LLM_BASE_URL=https://api.groq.com/openai/v1/chat/completions
         f.write(env_content)
     print("\n✅ Successfully created/updated .env file!")
 
+def check_api_key(api_key):
+    req = urllib.request.Request(
+        "https://api.groq.com/openai/v1/models",
+        headers={"Authorization": f"Bearer {api_key}"}
+    )
+    try:
+        urllib.request.urlopen(req)
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return False
+        # If there's another error (like 500), we don't necessarily want to block the user
+        return True
+    except Exception:
+        # Network error, etc.
+        return True
+
+custom_style = questionary.Style([
+    ('qmark', 'fg:#5f87ff bold'),       # token in front of the question
+    ('question', 'bold'),               # question text
+    ('answer', 'fg:#00af00 bold'),      # submitted answer text behind the question
+    ('pointer', 'fg:#00af00 bold'),     # pointer used in select and checkbox prompts
+    ('highlighted', 'fg:#00af00 bold'), # pointed-at choice in select and checkbox prompts
+    ('selected', 'fg:#00af00'),         # style for a selected item of a checkbox
+    ('separator', 'fg:#cc5454'),        # separator in lists
+    ('instruction', ''),                # user instructions for select, rawselect, checkbox
+    ('text', ''),                       # plain text
+    ('disabled', 'fg:#858585 italic')   # disabled choices for select and checkbox prompts
+])
+
 def main():
     print("🎙️ Welcome to the vowit configuration wizard!\n")
 
-    api_key = questionary.password(
-        "Enter your Groq API Key (https://console.groq.com/keys):",
-        validate=lambda text: len(text) > 0 or "API key cannot be empty"
-    ).ask()
+    while True:
+        api_key = questionary.password(
+            "Enter your Groq API Key (https://console.groq.com/keys):",
+            validate=lambda text: len(text) > 0 or "API key cannot be empty",
+            style=custom_style
+        ).ask()
 
-    if not api_key:
-        return
+        if not api_key:
+            return
+
+        print("⏳ Verifying API key...")
+        if check_api_key(api_key):
+            print("✅ API key is valid!\n")
+            break
+        else:
+            print("❌ Invalid API key. Please check your key and try again.\n")
 
     # Spoken language
     spoken_lang_name = questionary.autocomplete(
         "Which language will you speak? (Type to search)",
         choices=list(LANGUAGES.keys()),
-        validate=lambda text: text in LANGUAGES or "Please select a valid language from the list"
+        validate=lambda text: text in LANGUAGES or "Please select a valid language from the list",
+        style=custom_style
     ).ask()
 
     if not spoken_lang_name:
@@ -59,8 +101,10 @@ def main():
     # UI Language logic based on spoken language
     if spoken_lang_name == "Russian":
         ui_choice = questionary.select(
-            "Which language do you prefer for desktop notifications?",
-            choices=["Russian (ru)", "English (en)"]
+            "Which language do you prefer for desktop notifications? (Default: English)",
+            choices=["English (en)", "Russian (ru)"],
+            default="English (en)",
+            style=custom_style
         ).ask()
         ui_language = "ru" if "Russian" in ui_choice else "en"
     else:
@@ -69,34 +113,39 @@ def main():
         ui_language = "en"
 
     whisper_model = questionary.select(
-        "Which Whisper model do you want to use?",
+        "Which Whisper model do you want to use? (Default: whisper-large-v3)",
         choices=[
             "whisper-large-v3 (Best overall)",
             "whisper-large-v3-turbo (Faster)",
             "distil-whisper-large-v3-en (English only, fastest)"
-        ]
+        ],
+        default="whisper-large-v3 (Best overall)",
+        style=custom_style
     ).ask()
     whisper_model = whisper_model.split(" ")[0]
 
     llm_model = questionary.select(
-        "Which LLM do you want to use for the grammar fix feature?",
+        "Which LLM do you want to use for the grammar fix feature? (Default: openai/gpt-oss-120b)",
         choices=[
             "llama-3.3-70b-versatile",
             "gemma2-9b-it",
             "mixtral-8x7b-32768",
             "openai/gpt-oss-120b"
         ],
-        default="openai/gpt-oss-120b"
+        default="openai/gpt-oss-120b",
+        style=custom_style
     ).ask()
 
     keep_context = questionary.confirm(
-        "Keep context between rapid recordings? (Recommended)",
-        default=True
+        "Keep context between rapid recordings? (Recommended) [Default: Yes]",
+        default=True,
+        style=custom_style
     ).ask()
 
     debug_mode = questionary.confirm(
-        "Enable debug logging?",
-        default=False
+        "Enable debug logging? [Default: No]",
+        default=False,
+        style=custom_style
     ).ask()
 
     config = {

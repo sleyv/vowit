@@ -469,11 +469,6 @@ class AudioDaemon:
         title = get_string("rec_mic_title") if source == "mic" else get_string("rec_sys_title")
         msg = get_string("rec_mic_msg") if source == "mic" else get_string("rec_sys_msg")
 
-        self._show_notification(title, msg)
-
-        # Play start sound
-        play_sound("/usr/share/sounds/freedesktop/stereo/service-login.oga")
-
         input_device = "default" if source == "mic" else "@DEFAULT_SINK@.monitor"
 
         ffmpeg_cmd = [
@@ -482,7 +477,13 @@ class AudioDaemon:
             "-f", "s16le", "-"
         ]
 
+        # Start ffmpeg capture task first so recording begins immediately
         asyncio.create_task(self._start_ffmpeg(ffmpeg_cmd, self.transcription_queue, self.full_transcription))
+
+        # Play start sound
+        play_sound("/usr/share/sounds/freedesktop/stereo/service-login.oga")
+
+        self._show_notification(title, msg)
 
         # Start the 10-minute timeout task
         self.timeout_task = asyncio.create_task(self._recording_timeout())
@@ -625,13 +626,16 @@ class AudioDaemon:
                     text = await fix_text_with_llm(text)
                     os.remove(FIX_FLAG_FILE)
 
+                # 1. Copy to clipboard immediately
                 subprocess.run(["wl-copy"], input=text, text=True)
+
+                # 2. Play sound
+                play_sound("/usr/share/sounds/freedesktop/stereo/message-new-instant.oga")
+
+                # 3. Format and show notification
                 clean_text = " ".join(text.splitlines())[:40]
                 if len(text) > 40:
                     clean_text += "..."
-
-                # Play success transcription sound
-                play_sound("/usr/share/sounds/freedesktop/stereo/message-new-instant.oga")
 
                 self._show_notification(get_string("success_title"), clean_text)
 
