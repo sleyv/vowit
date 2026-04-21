@@ -1,23 +1,30 @@
 import os
 import urllib.request
 import urllib.error
+import json
 import questionary
 
 LANGUAGES = {
-    "English": "en",
-    "Russian": "ru",
-    "Spanish": "es",
-    "French": "fr",
-    "German": "de",
-    "Chinese": "zh",
-    "Japanese": "ja",
-    "Korean": "ko",
-    "Italian": "it",
-    "Portuguese": "pt",
-    "Turkish": "tr",
-    "Polish": "pl",
-    "Ukrainian": "uk",
-    "Arabic": "ar"
+    "Afrikaans": "af", "Albanian": "sq", "Amharic": "am", "Arabic": "ar", "Armenian": "hy",
+    "Assamese": "as", "Azerbaijani": "az", "Bashkir": "ba", "Basque": "eu", "Belarusian": "be",
+    "Bengali": "bn", "Bosnian": "bs", "Breton": "br", "Bulgarian": "bg", "Burmese": "my",
+    "Cantonese": "yue", "Catalan": "ca", "Chinese": "zh", "Croatian": "hr", "Czech": "cs",
+    "Danish": "da", "Dutch": "nl", "English": "en", "Estonian": "et", "Faroese": "fo",
+    "Finnish": "fi", "French": "fr", "Galician": "gl", "Georgian": "ka", "German": "de",
+    "Greek": "el", "Gujarati": "gu", "Haitian Creole": "ht", "Hausa": "ha", "Hawaiian": "haw",
+    "Hebrew": "he", "Hindi": "hi", "Hungarian": "hu", "Icelandic": "is", "Indonesian": "id",
+    "Italian": "it", "Japanese": "ja", "Javanese": "jv", "Kannada": "kn", "Kazakh": "kk",
+    "Khmer": "km", "Korean": "ko", "Lao": "lo", "Latin": "la", "Latvian": "lv",
+    "Lingala": "ln", "Lithuanian": "lt", "Luxembourgish": "lb", "Macedonian": "mk", "Malagasy": "mg",
+    "Malay": "ms", "Malayalam": "ml", "Maltese": "mt", "Maori": "mi", "Marathi": "mr",
+    "Mongolian": "mn", "Nepali": "ne", "Norwegian": "no", "Norwegian Nynorsk": "nn", "Occitan": "oc",
+    "Pashto": "ps", "Persian": "fa", "Polish": "pl", "Portuguese": "pt", "Punjabi": "pa",
+    "Romanian": "ro", "Russian": "ru", "Sanskrit": "sa", "Serbian": "sr", "Shona": "sn",
+    "Sindhi": "sd", "Sinhala": "si", "Slovak": "sk", "Slovenian": "sl", "Somali": "so",
+    "Spanish": "es", "Sundanese": "su", "Swahili": "sw", "Swedish": "sv", "Tagalog": "tl",
+    "Tajik": "tg", "Tamil": "ta", "Tatar": "tt", "Telugu": "te", "Thai": "th",
+    "Tibetan": "bo", "Turkish": "tr", "Turkmen": "tk", "Ukrainian": "uk", "Urdu": "ur",
+    "Uzbek": "uz", "Vietnamese": "vi", "Welsh": "cy", "Yiddish": "yi", "Yoruba": "yo"
 }
 
 def create_env_file(config):
@@ -35,22 +42,30 @@ LLM_BASE_URL=https://api.groq.com/openai/v1/chat/completions
         f.write(env_content)
     print("\n✅ Successfully created/updated .env file!")
 
-def check_api_key(api_key):
+def check_api_key_and_get_models(api_key):
     req = urllib.request.Request(
         "https://api.groq.com/openai/v1/models",
         headers={"Authorization": f"Bearer {api_key}"}
     )
     try:
-        urllib.request.urlopen(req)
-        return True
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            models = [m['id'] for m in data.get('data', []) if 'whisper' not in m['id']]
+            # Keep common text models to avoid cluttering UI with legacy ones
+            models = [m for m in models if 'llama' in m or 'gemma' in m or 'mixtral' in m]
+
+            # The custom model user mentioned earlier isn't a standard Groq ID, but they use OpenRouter locally for it.
+            if "openai/gpt-oss-120b" not in models:
+                models.append("openai/gpt-oss-120b")
+
+            return True, sorted(models)
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
-            return False
-        # If there's another error (like 500), we don't necessarily want to block the user
-        return True
+            return False, []
+        return True, []
     except Exception:
         # Network error, etc.
-        return True
+        return True, []
 
 custom_style = questionary.Style([
     ('qmark', 'fg:#5f87ff bold'),       # token in front of the question
@@ -78,8 +93,10 @@ def main():
         if not api_key:
             return
 
-        print("⏳ Verifying API key...")
-        if check_api_key(api_key):
+        print("⏳ Verifying API key and fetching models...")
+        is_valid, fetched_models = check_api_key_and_get_models(api_key)
+
+        if is_valid:
             print("✅ API key is valid!\n")
             break
         else:
@@ -124,15 +141,18 @@ def main():
     ).ask()
     whisper_model = whisper_model.split(" ")[0]
 
-    llm_model = questionary.select(
-        "Which LLM do you want to use for the grammar fix feature? (Default: openai/gpt-oss-120b)",
-        choices=[
+    if not fetched_models:
+        fetched_models = [
             "llama-3.3-70b-versatile",
             "gemma2-9b-it",
             "mixtral-8x7b-32768",
             "openai/gpt-oss-120b"
-        ],
-        default="openai/gpt-oss-120b",
+        ]
+
+    llm_model = questionary.select(
+        "Which LLM do you want to use for the grammar fix feature? (Default: openai/gpt-oss-120b)",
+        choices=fetched_models,
+        default="openai/gpt-oss-120b" if "openai/gpt-oss-120b" in fetched_models else fetched_models[0],
         style=custom_style
     ).ask()
 
