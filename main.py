@@ -222,76 +222,6 @@ def wav_to_ogg(wav_bytes: bytes) -> bytes:
         return wav_bytes
 
 
-def _extract_audio_sync(audio_bytes: bytes) -> np.ndarray | None:
-    """Synchronous helper to extract audio from audio bytes."""
-    try:
-        with av.open(io.BytesIO(audio_bytes)) as container:
-            stream = container.streams.audio[0]
-            resampler = av.AudioResampler(
-                format="s16", layout="mono", rate=16000
-            )
-
-            pcm_chunks = []
-            for frame in container.decode(stream):
-                for r_frame in resampler.resample(frame):
-                    pcm_chunks.append(r_frame.to_ndarray())
-
-            if not pcm_chunks:
-                raise RuntimeError("No frames decoded")
-
-            raw_audio = (
-                np.concatenate(pcm_chunks, axis=1).flatten().astype(np.float32)
-            )
-            return raw_audio
-    except Exception as e:
-        logging.error(f"Failed to decode audio bytes: {e}")
-        return None
-
-def _apply_vad_and_limit_sync(raw_audio: np.ndarray) -> bytes | None:
-    """Synchronous CPU-bound function to apply TrueRMS and VAD, returning OGG bytes."""
-    session = get_vad_session()
-    vad = ONNXVAD(session) if session is not None else None
-    limiter = TrueRMSLimiter(target_rms=TARGET_RMS, max_gain=MAX_GAIN)
-
-    roll_ch = raw_audio / 32768.0
-
-    buffer = []
-    history_q: deque[np.ndarray] = deque(maxlen=15)
-    state_speech = False
-
-    while len(roll_ch) >= CHUNK_VAD_16K:
-        c16 = roll_ch[:CHUNK_VAD_16K].copy().flatten()
-        roll_ch = roll_ch[CHUNK_VAD_16K:]
-
-        c16 = limiter.process(c16).flatten()
-        history_q.append(c16)
-
-        if vad is not None:
-            res = vad(c16)
-            if not state_speech and res == "start":
-                state_speech = True
-                hq_list = list(history_q)
-                buffer.extend(hq_list[:-1])
-                buffer.append(c16)
-            elif state_speech:
-                buffer.append(c16)
-                if res == "end":
-                    state_speech = False
-                    history_q.clear()
-        else:
-            buffer.append(c16)
-
-    if not buffer:
-        logging.info("No speech detected in input.")
-        return None
-
-    audio_np = np.concatenate(buffer)
-    if len(audio_np) < RATE_WHISPER * 0.5:
-        logging.info("Audio too short after VAD processing.")
-        return None
-
-    wav_file_data = _make_wav(audio_np, 16000)
-    return wav_to_ogg(wav_file_data)
 
 
 async def fix_text_with_llm(text: str) -> str:
@@ -345,21 +275,11 @@ async def fix_text_with_llm(text: str) -> str:
         return text
 
 
-async def process_audio_bytes(audio_bytes: bytes) -> tuple[str, bytes]:
+async def process_ready_audio(file_data: bytes) -> tuple[str, bytes]:
     """
-    Reads input audio bytes, applies denoise, VAD, gain,
-    outputs (final text, processed wav bytes) from Groq Whisper.
+    Sends the pre-processed audio bytes to Groq Whisper.
     """
-    if not audio_bytes or len(audio_bytes) < 100:
-        logging.info("Audio too small or empty.")
-        return "", b""
-
-    raw_audio = await asyncio.to_thread(_extract_audio_sync, audio_bytes)
-    if raw_audio is None:
-        return "", b""
-
-    file_data = await asyncio.to_thread(_apply_vad_and_limit_sync, raw_audio)
-    if file_data is None:
+    if not file_data:
         return "", b""
 
     # Replaced config with env vars as requested.
@@ -385,8 +305,9 @@ async def process_audio_bytes(audio_bytes: bytes) -> tuple[str, bytes]:
 
     try:
         async with aiohttp.ClientSession() as session_http:
+            api_url = os.environ.get("GROQ_API_URL", "https://api.groq.com/openai/v1/audio/transcriptions")
             async with session_http.post(
-                "https://api.groq.com/openai/v1/audio/transcriptions",
+                api_url,
                 headers=headers,
                 data=data,
             ) as resp:
@@ -445,6 +366,14 @@ class AudioDaemon:
         self.processing_task = None
         self.timeout_task = None
 
+        # Real-time processing state
+        self.vad = None
+        self.limiter = None
+        self.speech_buffer = []
+        self.history_q = None
+        self.state_speech = False
+        self.chunk_remainder = b""
+
     async def _recording_timeout(self):
         # Wait for 10 minutes (600 seconds)
         await asyncio.sleep(600)
@@ -453,10 +382,40 @@ class AudioDaemon:
             self.stop_recording()
 
     async def _read_stdout(self):
+        chunk_size_bytes = CHUNK_VAD_16K * 2
+
         while self.process and not self.process.stdout.at_eof():
             chunk = await self.process.stdout.read(4096)
-            if chunk:
-                self.audio_chunks.append(chunk)
+            if not chunk:
+                continue
+
+            self.chunk_remainder += chunk
+
+            while len(self.chunk_remainder) >= chunk_size_bytes:
+                chunk_bytes = self.chunk_remainder[:chunk_size_bytes]
+                self.chunk_remainder = self.chunk_remainder[chunk_size_bytes:]
+
+                audio_np = np.frombuffer(chunk_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+
+                c16 = self.limiter.process(audio_np).flatten()
+                self.history_q.append(c16)
+
+                if self.vad is not None:
+                    # ONNXVAD is not async, but we can run it in event loop as it's fast enough
+                    # for real-time chunks (32ms).
+                    res = self.vad(c16)
+                    if not self.state_speech and res == "start":
+                        self.state_speech = True
+                        hq_list = list(self.history_q)
+                        self.speech_buffer.extend(hq_list[:-1])
+                        self.speech_buffer.append(c16)
+                    elif self.state_speech:
+                        self.speech_buffer.append(c16)
+                        if res == "end":
+                            self.state_speech = False
+                            self.history_q.clear()
+                else:
+                    self.speech_buffer.append(c16)
 
     def start_recording(self, source="mic"):
         if self.is_recording:
@@ -464,6 +423,14 @@ class AudioDaemon:
 
         self.is_recording = True
         self.audio_chunks = []
+
+        session = get_vad_session()
+        self.vad = ONNXVAD(session) if session is not None else None
+        self.limiter = TrueRMSLimiter(target_rms=TARGET_RMS, max_gain=MAX_GAIN)
+        self.speech_buffer = []
+        self.history_q = deque(maxlen=15)
+        self.state_speech = False
+        self.chunk_remainder = b""
 
         title = get_string("rec_mic_title") if source == "mic" else get_string("rec_sys_title")
         msg = get_string("rec_mic_msg") if source == "mic" else get_string("rec_sys_msg")
@@ -481,7 +448,7 @@ class AudioDaemon:
         ffmpeg_cmd = [
             "ffmpeg", "-nostdin", "-v", "quiet", "-f", "pulse", "-i", input_device,
             "-metadata", "title=groq_audio", "-ac", "1", "-ar", "16000",
-            "-c:a", "libopus", "-f", "ogg", "-"
+            "-f", "s16le", "-"
         ]
 
         asyncio.create_task(self._start_ffmpeg(ffmpeg_cmd))
@@ -544,9 +511,18 @@ class AudioDaemon:
                         pass
                 await self.process.wait()
 
-            audio_bytes = b"".join(self.audio_chunks)
-
-            text, _ = await process_audio_bytes(audio_bytes)
+            if not self.speech_buffer:
+                logging.info("No speech detected during recording.")
+                text = ""
+            else:
+                audio_np = np.concatenate(self.speech_buffer)
+                if len(audio_np) < RATE_WHISPER * 0.5:
+                    logging.info("Speech audio too short.")
+                    text = ""
+                else:
+                    wav_file_data = _make_wav(audio_np, 16000)
+                    ogg_data = wav_to_ogg(wav_file_data)
+                    text, _ = await process_ready_audio(ogg_data)
 
             # Close the "Processing..." notification explicitly so the next one pops up as a fresh notification
             if repl_id:
