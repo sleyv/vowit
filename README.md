@@ -18,6 +18,8 @@
 
 - 🎙️ **Dual Capture**: Record microphone or system audio.
 - 🔇 **Smart Trimming**: Silero VAD (ONNX) filters noise and trims silence.
+- 🚀 **Real-time Streaming**: Transcribes audio in chunks on the fly as you speak.
+- 🧠 **Context Awareness**: Preserves your sentence context across rapid separate recordings.
 - ⚡ **Zero-Latency**: Ultra-fast CLI toggling, ready for global hotkeys.
 - ✨ **LLM Fixes**: Optional grammar correction via Groq LLM.
 - 🔊 **Sound Feedback**: Native `freedesktop` notification sounds.
@@ -68,14 +70,14 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-#### 3. Setup Environment Variables
+#### 3. Run Configuration Wizard
 You must have a **Groq API Key**.
 1. Generate an API key in the [Groq Cloud Console](https://console.groq.com/keys).
-2. Create a `.env` file from the provided template:
+2. Run the included setup wizard to configure your `.env` file automatically:
    ```bash
-   cp .env.example .env
+   python3 configure.py
    ```
-3. Edit the `.env` file and paste your `GROQ_API_KEY`. There are also other interesting settings you can explore and customize, such as UI language and Whisper model!
+   *The wizard will ask you for your API key, your spoken language, UI preferences, and debugging options.*
 
 ---
 

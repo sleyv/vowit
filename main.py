@@ -443,6 +443,7 @@ class AudioDaemon:
                             if buffer_len_seconds >= 10.0:
                                 chunk_to_send = list(speech_buffer)
                                 speech_buffer.clear()
+                                logging.debug(f"Dispatching chunk of {buffer_len_seconds:.2f}s")
                                 transcription_queue.put_nowait(chunk_to_send)
                 else:
                     speech_buffer.append(c16)
@@ -705,5 +706,9 @@ async def main():
             os.remove(PID_FILE)
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    is_debug = os.environ.get("DEBUG", "false").lower() == "true"
+    logging.basicConfig(
+        level=logging.DEBUG if is_debug else logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s"
+    )
     asyncio.run(main())

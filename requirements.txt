@@ -3,3 +3,4 @@ aiohttp
 onnxruntime
 av
 python-dotenv
+questionary==2.0.1
