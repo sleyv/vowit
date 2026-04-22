@@ -40,6 +40,7 @@ import io
 import struct
 import logging
 import subprocess
+import time
 from collections import deque
 
 import aiohttp
@@ -68,7 +69,9 @@ STRINGS = {
         "success_title": "✅ Processed",
         "error_title": "❌ Error",
         "error_msg": "Failed to transcribe text",
-        "sys_error_title": "❌ System Error"
+        "sys_error_title": "❌ System Error",
+        "net_error_title": "📡 Network Error",
+        "net_error_msg": "Failed to connect to API"
     },
     "ru": {
         "rec_mic_title": "🎙️ Запись (Микрофон)",
@@ -82,7 +85,9 @@ STRINGS = {
         "success_title": "✅ Запись обработана",
         "error_title": "❌ Ошибка",
         "error_msg": "Не удалось распознать текст",
-        "sys_error_title": "❌ Системная Ошибка"
+        "sys_error_title": "❌ Системная Ошибка",
+        "net_error_title": "📡 Ошибка сети",
+        "net_error_msg": "Нет доступа к сети / API"
     }
 }
 
@@ -222,76 +227,6 @@ def wav_to_ogg(wav_bytes: bytes) -> bytes:
         return wav_bytes
 
 
-def _extract_audio_sync(audio_bytes: bytes) -> np.ndarray | None:
-    """Synchronous helper to extract audio from audio bytes."""
-    try:
-        with av.open(io.BytesIO(audio_bytes)) as container:
-            stream = container.streams.audio[0]
-            resampler = av.AudioResampler(
-                format="s16", layout="mono", rate=16000
-            )
-
-            pcm_chunks = []
-            for frame in container.decode(stream):
-                for r_frame in resampler.resample(frame):
-                    pcm_chunks.append(r_frame.to_ndarray())
-
-            if not pcm_chunks:
-                raise RuntimeError("No frames decoded")
-
-            raw_audio = (
-                np.concatenate(pcm_chunks, axis=1).flatten().astype(np.float32)
-            )
-            return raw_audio
-    except Exception as e:
-        logging.error(f"Failed to decode audio bytes: {e}")
-        return None
-
-def _apply_vad_and_limit_sync(raw_audio: np.ndarray) -> bytes | None:
-    """Synchronous CPU-bound function to apply TrueRMS and VAD, returning OGG bytes."""
-    session = get_vad_session()
-    vad = ONNXVAD(session) if session is not None else None
-    limiter = TrueRMSLimiter(target_rms=TARGET_RMS, max_gain=MAX_GAIN)
-
-    roll_ch = raw_audio / 32768.0
-
-    buffer = []
-    history_q: deque[np.ndarray] = deque(maxlen=15)
-    state_speech = False
-
-    while len(roll_ch) >= CHUNK_VAD_16K:
-        c16 = roll_ch[:CHUNK_VAD_16K].copy().flatten()
-        roll_ch = roll_ch[CHUNK_VAD_16K:]
-
-        c16 = limiter.process(c16).flatten()
-        history_q.append(c16)
-
-        if vad is not None:
-            res = vad(c16)
-            if not state_speech and res == "start":
-                state_speech = True
-                hq_list = list(history_q)
-                buffer.extend(hq_list[:-1])
-                buffer.append(c16)
-            elif state_speech:
-                buffer.append(c16)
-                if res == "end":
-                    state_speech = False
-                    history_q.clear()
-        else:
-            buffer.append(c16)
-
-    if not buffer:
-        logging.info("No speech detected in input.")
-        return None
-
-    audio_np = np.concatenate(buffer)
-    if len(audio_np) < RATE_WHISPER * 0.5:
-        logging.info("Audio too short after VAD processing.")
-        return None
-
-    wav_file_data = _make_wav(audio_np, 16000)
-    return wav_to_ogg(wav_file_data)
 
 
 async def fix_text_with_llm(text: str) -> str:
@@ -326,40 +261,40 @@ async def fix_text_with_llm(text: str) -> str:
         "temperature": 0.2
     }
 
-    try:
-        async with aiohttp.ClientSession() as session_http:
-            async with session_http.post(
-                llm_base_url,
-                headers=headers,
-                json=payload,
-            ) as resp:
-                if resp.status != 200:
-                    err = await resp.text()
-                    logging.error(f"LLM API Error {resp.status}: {err}")
-                    return text
-                json_resp = await resp.json()
-                fixed_text = json_resp.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-                return fixed_text if fixed_text else text
-    except Exception as e:
-        logging.error(f"Error calling Groq LLM API: {e}")
-        return text
+    for attempt in range(3):
+        try:
+            start_time = time.perf_counter()
+            async with aiohttp.ClientSession() as session_http:
+                async with session_http.post(
+                    llm_base_url,
+                    headers=headers,
+                    json=payload,
+                ) as resp:
+                    if resp.status != 200:
+                        err = await resp.text()
+                        logging.error(f"LLM API Error {resp.status}: {err}")
+                        return text
+                    json_resp = await resp.json()
+                    fixed_text = json_resp.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                    elapsed = time.perf_counter() - start_time
+                    logging.info(f"LLM grammar correction took {elapsed:.2f}s")
+                    return fixed_text if fixed_text else text
+        except aiohttp.ClientError as e:
+            logging.error(f"Network error calling LLM API (attempt {attempt + 1}/3): {e}")
+            if attempt < 2:
+                await asyncio.sleep(1)
+        except Exception as e:
+            logging.error(f"Error calling Groq LLM API: {e}")
+            return text
+
+    return "network_error"
 
 
-async def process_audio_bytes(audio_bytes: bytes) -> tuple[str, bytes]:
+async def process_ready_audio(file_data: bytes, prompt: str = "") -> tuple[str, bytes]:
     """
-    Reads input audio bytes, applies denoise, VAD, gain,
-    outputs (final text, processed wav bytes) from Groq Whisper.
+    Sends the pre-processed audio bytes to Groq Whisper.
     """
-    if not audio_bytes or len(audio_bytes) < 100:
-        logging.info("Audio too small or empty.")
-        return "", b""
-
-    raw_audio = await asyncio.to_thread(_extract_audio_sync, audio_bytes)
-    if raw_audio is None:
-        return "", b""
-
-    file_data = await asyncio.to_thread(_apply_vad_and_limit_sync, raw_audio)
-    if file_data is None:
+    if not file_data:
         return "", b""
 
     # Replaced config with env vars as requested.
@@ -376,6 +311,9 @@ async def process_audio_bytes(audio_bytes: bytes) -> tuple[str, bytes]:
         # Pass language hint to Whisper (ISO-639-1)
         data.add_field("language", bot_language.lower()[:2])
 
+    if prompt:
+        data.add_field("prompt", prompt)
+
     data.add_field(
         "file",
         file_data,
@@ -383,27 +321,33 @@ async def process_audio_bytes(audio_bytes: bytes) -> tuple[str, bytes]:
         content_type="audio/ogg",
     )
 
-    try:
-        async with aiohttp.ClientSession() as session_http:
-            async with session_http.post(
-                "https://api.groq.com/openai/v1/audio/transcriptions",
-                headers=headers,
-                data=data,
-            ) as resp:
-                if resp.status != 200:
-                    err = await resp.text()
-                    logging.error(
-                        f"Groq Whisper API Error {resp.status}: {err}"
-                    )
-                    return "", b""
-                json_resp = await resp.json()
-                text = json_resp.get("text", "").strip()
-                return text, file_data
-    except Exception as e:
-        logging.error(f"Error calling Groq API: {e}")
-        return "", b""
+    for attempt in range(3):
+        try:
+            async with aiohttp.ClientSession() as session_http:
+                api_url = os.environ.get("GROQ_API_URL", "https://api.groq.com/openai/v1/audio/transcriptions")
+                async with session_http.post(
+                    api_url,
+                    headers=headers,
+                    data=data,
+                ) as resp:
+                    if resp.status != 200:
+                        err = await resp.text()
+                        logging.error(
+                            f"Groq Whisper API Error {resp.status}: {err}"
+                        )
+                        return "", b""
+                    json_resp = await resp.json()
+                    text = json_resp.get("text", "").strip()
+                    return text, file_data
+        except aiohttp.ClientError as e:
+            logging.error(f"Network error calling Groq Whisper API (attempt {attempt + 1}/3): {e}")
+            if attempt < 2:
+                await asyncio.sleep(1)
+        except Exception as e:
+            logging.error(f"Error calling Groq API: {e}")
+            return "", b""
 
-ID_FILE = "/tmp/groq_notif.id"
+    return "network_error", b""
 
 def play_sound(sound_path):
     """Plays a sound using paplay, killing any existing paplay instances to prevent overlap issues."""
@@ -445,6 +389,33 @@ class AudioDaemon:
         self.processing_task = None
         self.timeout_task = None
 
+        # Real-time processing state
+        self.vad = None
+        self.limiter = None
+        self.speech_buffer = []
+        self.history_q = None
+        self.state_speech = False
+        self.chunk_remainder = b""
+
+        # Chunking/Streaming state
+        self.transcription_queue = None
+        self.worker_task = None
+
+        self.current_notif_id = None
+
+        self.last_final_transcription = ""
+        self.last_final_transcription_time = 0.0
+
+    def _show_notification(self, title, msg):
+        new_id = send_notification(title, msg, self.current_notif_id)
+        if new_id:
+            self.current_notif_id = new_id
+
+    def _close_notification(self):
+        if self.current_notif_id:
+            close_notification(self.current_notif_id)
+            self.current_notif_id = None
+
     async def _recording_timeout(self):
         # Wait for 10 minutes (600 seconds)
         await asyncio.sleep(600)
@@ -452,11 +423,51 @@ class AudioDaemon:
             logging.info("10-minute recording limit reached. Automatically stopping.")
             self.stop_recording()
 
-    async def _read_stdout(self):
-        while self.process and not self.process.stdout.at_eof():
-            chunk = await self.process.stdout.read(4096)
-            if chunk:
-                self.audio_chunks.append(chunk)
+    async def _read_stdout(self, process, limiter, vad, history_q, speech_buffer, transcription_queue):
+        chunk_size_bytes = CHUNK_VAD_16K * 2
+        chunk_remainder = b""
+        state_speech = False
+
+        while process and not process.stdout.at_eof():
+            chunk = await process.stdout.read(4096)
+            if not chunk:
+                continue
+
+            chunk_remainder += chunk
+
+            while len(chunk_remainder) >= chunk_size_bytes:
+                chunk_bytes = chunk_remainder[:chunk_size_bytes]
+                chunk_remainder = chunk_remainder[chunk_size_bytes:]
+
+                audio_np = np.frombuffer(chunk_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+
+                c16 = limiter.process(audio_np).flatten()
+                history_q.append(c16)
+
+                if vad is not None:
+                    # ONNXVAD is not async, but we can run it in event loop as it's fast enough
+                    # for real-time chunks (32ms).
+                    res = vad(c16)
+                    if not state_speech and res == "start":
+                        state_speech = True
+                        hq_list = list(history_q)
+                        speech_buffer.extend(hq_list[:-1])
+                        speech_buffer.append(c16)
+                    elif state_speech:
+                        speech_buffer.append(c16)
+                        if res == "end":
+                            state_speech = False
+                            history_q.clear()
+
+                            # Check if we should dispatch a chunk (>= 10 seconds of speech)
+                            buffer_len_seconds = (len(speech_buffer) * CHUNK_VAD_16K) / RATE_WHISPER
+                            if buffer_len_seconds >= 10.0:
+                                chunk_to_send = list(speech_buffer)
+                                speech_buffer.clear()
+                                logging.debug(f"Dispatching chunk of {buffer_len_seconds:.2f}s")
+                                transcription_queue.put_nowait(chunk_to_send)
+                else:
+                    speech_buffer.append(c16)
 
     def start_recording(self, source="mic"):
         if self.is_recording:
@@ -465,38 +476,104 @@ class AudioDaemon:
         self.is_recording = True
         self.audio_chunks = []
 
+        session = get_vad_session()
+        self.vad = ONNXVAD(session) if session is not None else None
+        self.limiter = TrueRMSLimiter(target_rms=TARGET_RMS, max_gain=MAX_GAIN)
+        self.speech_buffer = []
+        self.history_q = deque(maxlen=15)
+        self.state_speech = False
+        self.chunk_remainder = b""
+
+        self.transcription_queue = asyncio.Queue()
+        self.full_transcription = []
+
         title = get_string("rec_mic_title") if source == "mic" else get_string("rec_sys_title")
         msg = get_string("rec_mic_msg") if source == "mic" else get_string("rec_sys_msg")
-
-        notif_id = send_notification(title, msg)
-        if notif_id:
-            with open(ID_FILE, "w") as f:
-                f.write(notif_id)
-
-        # Play start sound
-        play_sound("/usr/share/sounds/freedesktop/stereo/service-login.oga")
 
         input_device = "default" if source == "mic" else "@DEFAULT_SINK@.monitor"
 
         ffmpeg_cmd = [
             "ffmpeg", "-nostdin", "-v", "quiet", "-f", "pulse", "-i", input_device,
             "-metadata", "title=groq_audio", "-ac", "1", "-ar", "16000",
-            "-c:a", "libopus", "-f", "ogg", "-"
+            "-f", "s16le", "-"
         ]
 
-        asyncio.create_task(self._start_ffmpeg(ffmpeg_cmd))
+        # Start ffmpeg capture task first so recording begins immediately
+        asyncio.create_task(self._start_ffmpeg(ffmpeg_cmd, self.transcription_queue, self.full_transcription))
+
+        # Play start sound
+        play_sound("/usr/share/sounds/freedesktop/stereo/service-login.oga")
+
+        self._show_notification(title, msg)
 
         # Start the 10-minute timeout task
         self.timeout_task = asyncio.create_task(self._recording_timeout())
 
-    async def _start_ffmpeg(self, ffmpeg_cmd):
-        self.process = await asyncio.create_subprocess_exec(
+        initial_prompt = ""
+        keep_context = os.environ.get("KEEP_CONTEXT_BETWEEN_RECORDINGS", "true").lower() == "true"
+        if keep_context and self.last_final_transcription:
+            time_since_last = time.time() - self.last_final_transcription_time
+            if time_since_last < 15.0:
+                words = self.last_final_transcription.split()
+                initial_prompt = " ".join(words[-15:]) if len(words) > 15 else self.last_final_transcription
+
+        # Start transcription worker
+        self.worker_task = asyncio.create_task(
+            self._transcription_worker(self.transcription_queue, self.full_transcription, prompt=initial_prompt)
+        )
+
+    async def _transcription_worker(self, queue, full_transcription_list, prompt=""):
+        while True:
+            chunk = await queue.get()
+            if chunk is None:  # EOF marker
+                queue.task_done()
+                break
+
+            chunk_start = time.perf_counter()
+            audio_np = np.concatenate(chunk)
+            if len(audio_np) >= RATE_WHISPER * 0.5:
+                wav_file_data = _make_wav(audio_np, 16000)
+                ogg_data = wav_to_ogg(wav_file_data)
+
+                # Send to API
+                text, _ = await process_ready_audio(ogg_data, prompt=prompt)
+
+                if text == "network_error":
+                    full_transcription_list.append("network_error")
+                    # Stop parsing further chunks if we have a critical network failure
+                    queue.task_done()
+                    break
+                elif text and text != "null" and "продолжение следует" not in text.lower():
+                    full_transcription_list.append(text)
+
+                    # Update prompt with the last ~10-15 words
+                    words = text.split()
+                    prompt = " ".join(words[-15:]) if len(words) > 15 else text
+
+            elapsed = time.perf_counter() - chunk_start
+            logging.info(f"Chunk processing (including API) took {elapsed:.2f}s")
+
+            queue.task_done()
+
+    async def _start_ffmpeg(self, ffmpeg_cmd, queue, full_transcription):
+        process = await asyncio.create_subprocess_exec(
             *ffmpeg_cmd,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL
         )
-        self.read_task = asyncio.create_task(self._read_stdout())
+
+        # In case stop was pressed before this task started
+        if not self.is_recording:
+            process.terminate()
+            return
+
+        self.process = process
+
+        self.read_task = asyncio.create_task(self._read_stdout(
+            process, self.limiter, self.vad, self.history_q,
+            self.speech_buffer, queue
+        ))
 
     def stop_recording(self):
         if not self.is_recording:
@@ -510,90 +587,132 @@ class AudioDaemon:
         # Play end sound
         play_sound("/usr/share/sounds/freedesktop/stereo/service-logout.oga")
 
-        repl_id = None
-        if os.path.exists(ID_FILE):
-            with open(ID_FILE, "r") as f:
-                repl_id = f.read().strip()
+        self._show_notification(get_string("processing_title"), get_string("processing_msg"))
 
-        notif_id = send_notification(get_string("processing_title"), get_string("processing_msg"), repl_id)
-        if notif_id:
-            with open(ID_FILE, "w") as f:
-                f.write(notif_id)
+        # Capture the current state and reset instance variables so immediate new recordings
+        # get fresh state.
+        old_process = self.process
+        old_read_task = self.read_task
+        old_worker_task = self.worker_task
+        old_queue = self.transcription_queue
+        old_speech_buffer = self.speech_buffer
+        old_full_transcription = self.full_transcription
 
-        if self.process:
-            self.process.terminate()
+        self.process = None
+        self.read_task = None
+        self.worker_task = None
+        self.transcription_queue = None
+        self.speech_buffer = []
+        self.full_transcription = []
 
         # We schedule processing in background
-        self.processing_task = asyncio.create_task(self._process_collected_audio())
+        self.processing_task = asyncio.create_task(self._process_collected_audio(
+            old_process, old_read_task, old_worker_task, old_queue, old_speech_buffer, old_full_transcription
+        ))
 
-    async def _process_collected_audio(self):
-        repl_id = None
-        if os.path.exists(ID_FILE):
-            with open(ID_FILE, "r") as f:
-                repl_id = f.read().strip()
-
+    async def _process_collected_audio(self, process, read_task, worker_task, queue, speech_buffer, full_transcription):
         try:
-            if self.read_task:
-                await self.read_task
+            finish_start_time = time.perf_counter()
 
-            if self.process:
-                if self.process.returncode is None:
+            # Allow a short grace period for ffmpeg to flush the last milliseconds of audio
+            if process and process.returncode is None:
+                await asyncio.sleep(0.3)
+                try:
+                    process.terminate()
+                except ProcessLookupError:
+                    pass
+
+            if read_task:
+                await read_task
+
+            if process:
+                if process.returncode is None:
                     try:
-                        self.process.kill()
+                        process.kill()
                     except ProcessLookupError:
                         pass
-                await self.process.wait()
+                await process.wait()
 
-            audio_bytes = b"".join(self.audio_chunks)
+            # Flush remaining audio
+            if speech_buffer and queue is not None:
+                queue.put_nowait(list(speech_buffer))
+                speech_buffer.clear()
 
-            text, _ = await process_audio_bytes(audio_bytes)
+            # Send EOF and wait for worker to finish
+            if queue is not None:
+                queue.put_nowait(None)
+
+            if worker_task is not None:
+                await worker_task
+
+            finish_elapsed = time.perf_counter() - finish_start_time
+            logging.info(f"Finalizing transcription queue took {finish_elapsed:.2f}s")
 
             # Close the "Processing..." notification explicitly so the next one pops up as a fresh notification
-            if repl_id:
-                close_notification(repl_id)
+            self._close_notification()
 
-            last_id = None
-            if "продолжение следует" in text.lower():
-                # Technically an error/silence state, play error or silence sound
+            text = " ".join(full_transcription).strip()
+
+            if "network_error" in full_transcription:
                 play_sound("/usr/share/sounds/freedesktop/stereo/message.oga")
-                last_id = send_notification(get_string("silence_title"), get_string("silence_msg"))
+                self._show_notification(get_string("net_error_title"), get_string("net_error_msg"))
+
+                # Filter out the error string and copy whatever text successfully transcribed beforehand
+                clean_transcription = " ".join([t for t in full_transcription if t != "network_error"]).strip()
+                if clean_transcription and clean_transcription != "null":
+                    subprocess.run(["wl-copy"], input=clean_transcription, text=True)
             elif text and text != "null":
-                if os.path.exists(FIX_FLAG_FILE):
+                llm_failed = False
+                fix_enabled = os.path.exists(FIX_FLAG_FILE) or os.environ.get("FIX_GRAMMAR_BY_DEFAULT", "false").lower() == "true"
+
+                if fix_enabled:
                     text = await fix_text_with_llm(text)
-                    os.remove(FIX_FLAG_FILE)
+                    if os.path.exists(FIX_FLAG_FILE):
+                        os.remove(FIX_FLAG_FILE)
+                    if text == "network_error":
+                        llm_failed = True
+                        play_sound("/usr/share/sounds/freedesktop/stereo/message.oga")
+                        self._show_notification(get_string("net_error_title"), get_string("net_error_msg"))
+                        text = " ".join(full_transcription).strip() # fallback to un-fixed text to at least copy it
 
-                subprocess.run(["wl-copy"], input=text, text=True)
-                clean_text = " ".join(text.splitlines())[:40]
-                if len(text) > 40:
-                    clean_text += "..."
+                if text != "network_error" and not llm_failed:
+                    # 1. Copy to clipboard immediately
+                    subprocess.run(["wl-copy"], input=text, text=True)
 
-                # Play success transcription sound
-                play_sound("/usr/share/sounds/freedesktop/stereo/message-new-instant.oga")
+                    # 2. Play sound
+                    play_sound("/usr/share/sounds/freedesktop/stereo/message-new-instant.oga")
 
-                last_id = send_notification(get_string("success_title"), clean_text)
+                    # 3. Format and show notification
+                    clean_text = " ".join(text.splitlines())[:40]
+                    if len(text) > 40:
+                        clean_text += "..."
+
+                    self._show_notification(get_string("success_title"), clean_text)
+
+                    self.last_final_transcription = text
+                    self.last_final_transcription_time = time.time()
+                elif llm_failed:
+                    # Just silently copy the text if LLM failed, we already showed the error notification
+                    subprocess.run(["wl-copy"], input=text, text=True)
             else:
-                # Play error sound
+                # Play error sound/silence sound
                 play_sound("/usr/share/sounds/freedesktop/stereo/message.oga")
-                last_id = send_notification(get_string("error_title"), get_string("error_msg"))
+                if not full_transcription:
+                    self._show_notification(get_string("silence_title"), get_string("silence_msg"))
+                else:
+                    self._show_notification(get_string("error_title"), get_string("error_msg"))
 
             # Let the notification stay for 4 seconds, then close it
             await asyncio.sleep(4)
-            if last_id:
-                close_notification(last_id)
+            self._close_notification()
 
-            if os.path.exists(ID_FILE):
-                os.remove(ID_FILE)
         except Exception as e:
             logging.error(f"Error during audio processing: {e}")
-            if repl_id:
-                close_notification(repl_id)
+            self._close_notification()
             play_sound("/usr/share/sounds/freedesktop/stereo/message.oga")
-            last_id = send_notification(get_string("sys_error_title"), str(e))
+            self._show_notification(get_string("sys_error_title"), str(e))
             await asyncio.sleep(4)
-            if last_id:
-                close_notification(last_id)
-            if os.path.exists(ID_FILE):
-                os.remove(ID_FILE)
+            self._close_notification()
         finally:
             if os.path.exists(FIX_FLAG_FILE):
                 os.remove(FIX_FLAG_FILE)
@@ -644,5 +763,9 @@ async def main():
             os.remove(PID_FILE)
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    is_debug = os.environ.get("DEBUG", "false").lower() == "true"
+    logging.basicConfig(
+        level=logging.DEBUG if is_debug else logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s"
+    )
     asyncio.run(main())
