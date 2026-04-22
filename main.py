@@ -602,9 +602,6 @@ class AudioDaemon:
         self.speech_buffer = []
         self.full_transcription = []
 
-        if old_process:
-            old_process.terminate()
-
         # We schedule processing in background
         self.processing_task = asyncio.create_task(self._process_collected_audio(
             old_process, old_read_task, old_worker_task, old_queue, old_speech_buffer, old_full_transcription
@@ -613,6 +610,15 @@ class AudioDaemon:
     async def _process_collected_audio(self, process, read_task, worker_task, queue, speech_buffer, full_transcription):
         try:
             finish_start_time = time.perf_counter()
+
+            # Allow a short grace period for ffmpeg to flush the last milliseconds of audio
+            if process and process.returncode is None:
+                await asyncio.sleep(0.3)
+                try:
+                    process.terminate()
+                except ProcessLookupError:
+                    pass
+
             if read_task:
                 await read_task
 
@@ -649,9 +655,12 @@ class AudioDaemon:
                 self._show_notification(get_string("net_error_title"), get_string("net_error_msg"))
             elif text and text != "null":
                 llm_failed = False
-                if os.path.exists(FIX_FLAG_FILE):
+                fix_enabled = os.path.exists(FIX_FLAG_FILE) or os.environ.get("FIX_GRAMMAR_BY_DEFAULT", "false").lower() == "true"
+
+                if fix_enabled:
                     text = await fix_text_with_llm(text)
-                    os.remove(FIX_FLAG_FILE)
+                    if os.path.exists(FIX_FLAG_FILE):
+                        os.remove(FIX_FLAG_FILE)
                     if text == "network_error":
                         llm_failed = True
                         play_sound("/usr/share/sounds/freedesktop/stereo/message.oga")

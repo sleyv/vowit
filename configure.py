@@ -34,8 +34,9 @@ UI_LANGUAGE={config.get('ui_language', 'en')}
 WHISPER_MODEL={config.get('whisper_model', 'whisper-large-v3')}
 BOT_LANGUAGE={config.get('bot_language', 'ru')}
 KEEP_CONTEXT_BETWEEN_RECORDINGS={str(config.get('keep_context', True)).lower()}
-LLM_MODEL={config.get('llm_model', 'openai/gpt-oss-120b')}
+LLM_MODEL={config.get('llm_model', 'llama-3.3-70b-versatile')}
 LLM_BASE_URL=https://api.groq.com/openai/v1/chat/completions
+FIX_GRAMMAR_BY_DEFAULT={str(config.get('fix_grammar', False)).lower()}
 """
     with open(".env", "w") as f:
         f.write(env_content)
@@ -83,20 +84,46 @@ custom_style = questionary.Style([
 ])
 
 def main():
+    from dotenv import load_dotenv
+    load_dotenv()
+    existing_key = os.environ.get("GROQ_API_KEY", "")
+
     print("🎙️ Welcome to the vowit configuration wizard!\n")
 
     while True:
-        api_key = questionary.password(
-            "Enter your Groq API Key (https://console.groq.com/keys):",
-            validate=lambda text: len(text) > 0 or "API key cannot be empty",
-            style=custom_style
-        ).ask()
+        if existing_key:
+            use_existing = questionary.confirm(
+                "An existing GROQ_API_KEY was found. Use it? (Press Enter for Yes)",
+                default=True,
+                style=custom_style
+            ).ask()
+            if use_existing:
+                api_key = existing_key
+            else:
+                api_key = questionary.password(
+                    "Enter your Groq API Key (https://console.groq.com/keys):",
+                    validate=lambda text: len(text) > 0 or "API key cannot be empty",
+                    style=custom_style
+                ).ask()
+        else:
+            api_key = questionary.password(
+                "Enter your Groq API Key (https://console.groq.com/keys):",
+                validate=lambda text: len(text) > 0 or "API key cannot be empty",
+                style=custom_style
+            ).ask()
 
         if not api_key:
             return
 
         print("⏳ Verifying API key and fetching models...")
-        is_valid, fetched_models = asyncio.run(check_api_key_and_get_models(api_key))
+
+        # We need a new event loop because prompt_toolkit leaves the default one in a running state
+        # or otherwise interferes with asyncio.run(). Creating a fresh isolated loop solves the RuntimeError.
+        loop = asyncio.new_event_loop()
+        try:
+            is_valid, fetched_models = loop.run_until_complete(check_api_key_and_get_models(api_key))
+        finally:
+            loop.close()
 
         if is_valid:
             print(f"✅ API key is valid! Successfully loaded {len(fetched_models)} text models.\n")
@@ -106,7 +133,7 @@ def main():
 
     # Spoken language
     spoken_lang_name = questionary.autocomplete(
-        "Which language will you speak? (Type to search)",
+        "Which language will you speak? (Type to search, press Tab to autocomplete/select, then Enter)",
         choices=list(LANGUAGES.keys()),
         validate=lambda text: text in LANGUAGES or "Please select a valid language from the list",
         match_middle=False,
@@ -136,8 +163,7 @@ def main():
         "Which Whisper model do you want to use? (Default: whisper-large-v3)",
         choices=[
             "whisper-large-v3 (Best overall)",
-            "whisper-large-v3-turbo (Faster)",
-            "distil-whisper-large-v3-en (English only, fastest)"
+            "whisper-large-v3-turbo (Faster)"
         ],
         default="whisper-large-v3 (Best overall)",
         style=custom_style
@@ -152,10 +178,22 @@ def main():
             "openai/gpt-oss-120b"
         ]
 
+    # Determine the safest default
+    if "llama-3.3-70b-versatile" in fetched_models:
+        default_model = "llama-3.3-70b-versatile"
+    else:
+        default_model = fetched_models[0]
+
     llm_model = questionary.select(
-        "Which LLM do you want to use for the grammar fix feature? (Default: openai/gpt-oss-120b)",
+        f"Which LLM do you want to use for the grammar fix feature? (Default: {default_model})",
         choices=fetched_models,
-        default="openai/gpt-oss-120b" if "openai/gpt-oss-120b" in fetched_models else fetched_models[0],
+        default=default_model,
+        style=custom_style
+    ).ask()
+
+    fix_grammar = questionary.confirm(
+        "Enable LLM grammar correction by default for all recordings? [Default: No]",
+        default=False,
         style=custom_style
     ).ask()
 
@@ -178,7 +216,8 @@ def main():
         "whisper_model": whisper_model,
         "bot_language": bot_language,
         "keep_context": keep_context,
-        "llm_model": llm_model
+        "llm_model": llm_model,
+        "fix_grammar": fix_grammar
     }
 
     create_env_file(config)
