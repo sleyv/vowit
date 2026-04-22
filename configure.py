@@ -43,10 +43,14 @@ LLM_BASE_URL=https://api.groq.com/openai/v1/chat/completions
 
 async def check_api_key_and_get_models(api_key):
     try:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/115.0"
+        }
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 "https://api.groq.com/openai/v1/models",
-                headers={"Authorization": f"Bearer {api_key}"}
+                headers=headers
             ) as resp:
                 if resp.status in (401, 403):
                     return False, []
@@ -78,7 +82,7 @@ custom_style = questionary.Style([
     ('disabled', 'fg:#858585 italic')   # disabled choices for select and checkbox prompts
 ])
 
-async def main():
+def main():
     print("🎙️ Welcome to the vowit configuration wizard!\n")
 
     while True:
@@ -92,7 +96,7 @@ async def main():
             return
 
         print("⏳ Verifying API key and fetching models...")
-        is_valid, fetched_models = await check_api_key_and_get_models(api_key)
+        is_valid, fetched_models = asyncio.run(check_api_key_and_get_models(api_key))
 
         if is_valid:
             print(f"✅ API key is valid! Successfully loaded {len(fetched_models)} text models.\n")
@@ -181,4 +185,4 @@ async def main():
     print("🎉 You are ready to go! Run the daemon using `python main.py &`")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

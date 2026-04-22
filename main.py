@@ -69,7 +69,9 @@ STRINGS = {
         "success_title": "✅ Processed",
         "error_title": "❌ Error",
         "error_msg": "Failed to transcribe text",
-        "sys_error_title": "❌ System Error"
+        "sys_error_title": "❌ System Error",
+        "net_error_title": "📡 Network Error",
+        "net_error_msg": "Failed to connect to API"
     },
     "ru": {
         "rec_mic_title": "🎙️ Запись (Микрофон)",
@@ -83,7 +85,9 @@ STRINGS = {
         "success_title": "✅ Запись обработана",
         "error_title": "❌ Ошибка",
         "error_msg": "Не удалось распознать текст",
-        "sys_error_title": "❌ Системная Ошибка"
+        "sys_error_title": "❌ Системная Ошибка",
+        "net_error_title": "📡 Ошибка сети",
+        "net_error_msg": "Нет доступа к сети / API"
     }
 }
 
@@ -257,23 +261,30 @@ async def fix_text_with_llm(text: str) -> str:
         "temperature": 0.2
     }
 
-    try:
-        async with aiohttp.ClientSession() as session_http:
-            async with session_http.post(
-                llm_base_url,
-                headers=headers,
-                json=payload,
-            ) as resp:
-                if resp.status != 200:
-                    err = await resp.text()
-                    logging.error(f"LLM API Error {resp.status}: {err}")
-                    return text
-                json_resp = await resp.json()
-                fixed_text = json_resp.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-                return fixed_text if fixed_text else text
-    except Exception as e:
-        logging.error(f"Error calling Groq LLM API: {e}")
-        return text
+    for attempt in range(3):
+        try:
+            async with aiohttp.ClientSession() as session_http:
+                async with session_http.post(
+                    llm_base_url,
+                    headers=headers,
+                    json=payload,
+                ) as resp:
+                    if resp.status != 200:
+                        err = await resp.text()
+                        logging.error(f"LLM API Error {resp.status}: {err}")
+                        return text
+                    json_resp = await resp.json()
+                    fixed_text = json_resp.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                    return fixed_text if fixed_text else text
+        except aiohttp.ClientError as e:
+            logging.error(f"Network error calling LLM API (attempt {attempt + 1}/3): {e}")
+            if attempt < 2:
+                await asyncio.sleep(1)
+        except Exception as e:
+            logging.error(f"Error calling Groq LLM API: {e}")
+            return text
+
+    return "network_error"
 
 
 async def process_ready_audio(file_data: bytes, prompt: str = "") -> tuple[str, bytes]:
@@ -307,26 +318,33 @@ async def process_ready_audio(file_data: bytes, prompt: str = "") -> tuple[str, 
         content_type="audio/ogg",
     )
 
-    try:
-        async with aiohttp.ClientSession() as session_http:
-            api_url = os.environ.get("GROQ_API_URL", "https://api.groq.com/openai/v1/audio/transcriptions")
-            async with session_http.post(
-                api_url,
-                headers=headers,
-                data=data,
-            ) as resp:
-                if resp.status != 200:
-                    err = await resp.text()
-                    logging.error(
-                        f"Groq Whisper API Error {resp.status}: {err}"
-                    )
-                    return "", b""
-                json_resp = await resp.json()
-                text = json_resp.get("text", "").strip()
-                return text, file_data
-    except Exception as e:
-        logging.error(f"Error calling Groq API: {e}")
-        return "", b""
+    for attempt in range(3):
+        try:
+            async with aiohttp.ClientSession() as session_http:
+                api_url = os.environ.get("GROQ_API_URL", "https://api.groq.com/openai/v1/audio/transcriptions")
+                async with session_http.post(
+                    api_url,
+                    headers=headers,
+                    data=data,
+                ) as resp:
+                    if resp.status != 200:
+                        err = await resp.text()
+                        logging.error(
+                            f"Groq Whisper API Error {resp.status}: {err}"
+                        )
+                        return "", b""
+                    json_resp = await resp.json()
+                    text = json_resp.get("text", "").strip()
+                    return text, file_data
+        except aiohttp.ClientError as e:
+            logging.error(f"Network error calling Groq Whisper API (attempt {attempt + 1}/3): {e}")
+            if attempt < 2:
+                await asyncio.sleep(1)
+        except Exception as e:
+            logging.error(f"Error calling Groq API: {e}")
+            return "", b""
+
+    return "network_error", b""
 
 def play_sound(sound_path):
     """Plays a sound using paplay, killing any existing paplay instances to prevent overlap issues."""
@@ -517,7 +535,12 @@ class AudioDaemon:
                 # Send to API
                 text, _ = await process_ready_audio(ogg_data, prompt=prompt)
 
-                if text and text != "null" and "продолжение следует" not in text.lower():
+                if text == "network_error":
+                    full_transcription_list.append("network_error")
+                    # Stop parsing further chunks if we have a critical network failure
+                    queue.task_done()
+                    break
+                elif text and text != "null" and "продолжение следует" not in text.lower():
                     full_transcription_list.append(text)
 
                     # Update prompt with the last ~10-15 words
@@ -621,26 +644,39 @@ class AudioDaemon:
 
             text = " ".join(full_transcription).strip()
 
-            if text and text != "null":
+            if "network_error" in full_transcription:
+                play_sound("/usr/share/sounds/freedesktop/stereo/message.oga")
+                self._show_notification(get_string("net_error_title"), get_string("net_error_msg"))
+            elif text and text != "null":
+                llm_failed = False
                 if os.path.exists(FIX_FLAG_FILE):
                     text = await fix_text_with_llm(text)
                     os.remove(FIX_FLAG_FILE)
+                    if text == "network_error":
+                        llm_failed = True
+                        play_sound("/usr/share/sounds/freedesktop/stereo/message.oga")
+                        self._show_notification(get_string("net_error_title"), get_string("net_error_msg"))
+                        text = " ".join(full_transcription).strip() # fallback to un-fixed text to at least copy it
 
-                # 1. Copy to clipboard immediately
-                subprocess.run(["wl-copy"], input=text, text=True)
+                if text != "network_error" and not llm_failed:
+                    # 1. Copy to clipboard immediately
+                    subprocess.run(["wl-copy"], input=text, text=True)
 
-                # 2. Play sound
-                play_sound("/usr/share/sounds/freedesktop/stereo/message-new-instant.oga")
+                    # 2. Play sound
+                    play_sound("/usr/share/sounds/freedesktop/stereo/message-new-instant.oga")
 
-                # 3. Format and show notification
-                clean_text = " ".join(text.splitlines())[:40]
-                if len(text) > 40:
-                    clean_text += "..."
+                    # 3. Format and show notification
+                    clean_text = " ".join(text.splitlines())[:40]
+                    if len(text) > 40:
+                        clean_text += "..."
 
-                self._show_notification(get_string("success_title"), clean_text)
+                    self._show_notification(get_string("success_title"), clean_text)
 
-                self.last_final_transcription = text
-                self.last_final_transcription_time = time.time()
+                    self.last_final_transcription = text
+                    self.last_final_transcription_time = time.time()
+                elif llm_failed:
+                    # Just silently copy the text if LLM failed, we already showed the error notification
+                    subprocess.run(["wl-copy"], input=text, text=True)
             else:
                 # Play error sound/silence sound
                 play_sound("/usr/share/sounds/freedesktop/stereo/message.oga")
