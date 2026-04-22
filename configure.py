@@ -1,7 +1,6 @@
 import os
-import urllib.request
-import urllib.error
-import json
+import aiohttp
+import asyncio
 import questionary
 
 LANGUAGES = {
@@ -42,25 +41,26 @@ LLM_BASE_URL=https://api.groq.com/openai/v1/chat/completions
         f.write(env_content)
     print("\n✅ Successfully created/updated .env file!")
 
-def check_api_key_and_get_models(api_key):
-    req = urllib.request.Request(
-        "https://api.groq.com/openai/v1/models",
-        headers={"Authorization": f"Bearer {api_key}"}
-    )
+async def check_api_key_and_get_models(api_key):
     try:
-        with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read().decode('utf-8'))
-            models = [m['id'] for m in data.get('data', []) if 'whisper' not in m['id']]
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://api.groq.com/openai/v1/models",
+                headers={"Authorization": f"Bearer {api_key}"}
+            ) as resp:
+                if resp.status in (401, 403):
+                    return False, []
+                if resp.status != 200:
+                    return True, []
 
-            # Ensure the custom model from previous steps is included if user relies on OpenRouter locally
-            if "openai/gpt-oss-120b" not in models:
-                models.append("openai/gpt-oss-120b")
+                data = await resp.json()
+                models = [m['id'] for m in data.get('data', []) if 'whisper' not in m['id']]
 
-            return True, sorted(models)
-    except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
-            return False, []
-        return True, []
+                # Ensure the custom model from previous steps is included if user relies on OpenRouter locally
+                if "openai/gpt-oss-120b" not in models:
+                    models.append("openai/gpt-oss-120b")
+
+                return True, sorted(models)
     except Exception:
         # Network error, etc.
         return True, []
@@ -78,7 +78,7 @@ custom_style = questionary.Style([
     ('disabled', 'fg:#858585 italic')   # disabled choices for select and checkbox prompts
 ])
 
-def main():
+async def main():
     print("🎙️ Welcome to the vowit configuration wizard!\n")
 
     while True:
@@ -92,10 +92,10 @@ def main():
             return
 
         print("⏳ Verifying API key and fetching models...")
-        is_valid, fetched_models = check_api_key_and_get_models(api_key)
+        is_valid, fetched_models = await check_api_key_and_get_models(api_key)
 
         if is_valid:
-            print("✅ API key is valid!\n")
+            print(f"✅ API key is valid! Successfully loaded {len(fetched_models)} text models.\n")
             break
         else:
             print("❌ Invalid API key. Please check your key and try again.\n")
@@ -105,6 +105,7 @@ def main():
         "Which language will you speak? (Type to search)",
         choices=list(LANGUAGES.keys()),
         validate=lambda text: text in LANGUAGES or "Please select a valid language from the list",
+        match_middle=False,
         style=custom_style
     ).ask()
 
@@ -180,4 +181,4 @@ def main():
     print("🎉 You are ready to go! Run the daemon using `python main.py &`")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
