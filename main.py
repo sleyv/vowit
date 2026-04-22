@@ -263,6 +263,7 @@ async def fix_text_with_llm(text: str) -> str:
 
     for attempt in range(3):
         try:
+            start_time = time.perf_counter()
             async with aiohttp.ClientSession() as session_http:
                 async with session_http.post(
                     llm_base_url,
@@ -275,6 +276,8 @@ async def fix_text_with_llm(text: str) -> str:
                         return text
                     json_resp = await resp.json()
                     fixed_text = json_resp.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                    elapsed = time.perf_counter() - start_time
+                    logging.info(f"LLM grammar correction took {elapsed:.2f}s")
                     return fixed_text if fixed_text else text
         except aiohttp.ClientError as e:
             logging.error(f"Network error calling LLM API (attempt {attempt + 1}/3): {e}")

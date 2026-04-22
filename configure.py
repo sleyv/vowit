@@ -74,9 +74,9 @@ custom_style = questionary.Style([
     ('qmark', 'fg:#5f87ff bold'),       # token in front of the question
     ('question', 'bold'),               # question text
     ('answer', 'fg:#00af00 bold'),      # submitted answer text behind the question
-    ('pointer', 'fg:#00af00 bold'),     # pointer used in select and checkbox prompts
-    ('highlighted', 'fg:#00af00 bold'), # pointed-at choice in select and checkbox prompts
-    ('selected', 'fg:#00af00'),         # style for a selected item of a checkbox
+    ('pointer', 'fg:#00d7ff bold'),     # pointer used in select and checkbox prompts
+    ('highlighted', 'fg:#00d7ff bold'), # pointed-at choice in select and checkbox prompts
+    ('selected', 'fg:#00d7ff'),         # style for a selected item of a checkbox
     ('separator', 'fg:#cc5454'),        # separator in lists
     ('instruction', ''),                # user instructions for select, rawselect, checkbox
     ('text', ''),                       # plain text
@@ -179,7 +179,9 @@ def main():
         ]
 
     # Determine the safest default
-    if "llama-3.3-70b-versatile" in fetched_models:
+    if "openai/gpt-oss-120b" in fetched_models:
+        default_model = "openai/gpt-oss-120b"
+    elif "llama-3.3-70b-versatile" in fetched_models:
         default_model = "llama-3.3-70b-versatile"
     else:
         default_model = fetched_models[0]
