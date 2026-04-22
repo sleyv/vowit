@@ -656,6 +656,11 @@ class AudioDaemon:
             if "network_error" in full_transcription:
                 play_sound("/usr/share/sounds/freedesktop/stereo/message.oga")
                 self._show_notification(get_string("net_error_title"), get_string("net_error_msg"))
+
+                # Filter out the error string and copy whatever text successfully transcribed beforehand
+                clean_transcription = " ".join([t for t in full_transcription if t != "network_error"]).strip()
+                if clean_transcription and clean_transcription != "null":
+                    subprocess.run(["wl-copy"], input=clean_transcription, text=True)
             elif text and text != "null":
                 llm_failed = False
                 fix_enabled = os.path.exists(FIX_FLAG_FILE) or os.environ.get("FIX_GRAMMAR_BY_DEFAULT", "false").lower() == "true"
