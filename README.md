@@ -22,6 +22,7 @@
 - 🧠 **Context Awareness**: Preserves your sentence context across rapid separate recordings.
 - ⚡ **Zero-Latency**: Ultra-fast CLI toggling, ready for global hotkeys.
 - ✨ **LLM Fixes**: Optional grammar correction via Groq LLM.
+- 🔢 **Multi-press**: 1 press → clipboard, 2 presses → auto-paste, 3 presses → system audio.
 - 🔊 **Sound Feedback**: Native `freedesktop` notification sounds.
 
 ---
@@ -30,7 +31,7 @@
 
 **Architecture & Goal:** `vowit` is a persistent background daemon. The CLI sends POSIX signals (via a PID file) to the daemon to toggle recording. Your primary goal is to install dependencies, autostart the daemon, and bind the CLI toggles to system hotkeys. You are authorized to improvise safely to make it work, as Linux environments vary wildly.
 
-1. **Prep:** Identify OS. Verify/install `ffmpeg`, `wl-clipboard`, `libnotify`, `pulseaudio-utils`. Clone repo -> create python venv -> install `requirements.txt` -> copy `.env.example` to `.env`.
+1. **Prep:** Identify OS. Verify/install `ffmpeg`, `wl-clipboard`, `wtype`, `libnotify`, `pulseaudio-utils`. Clone repo -> create python venv -> install `requirements.txt` -> copy `.env.example` to `.env`.
 2. **API Key:** If the user didn't provide a Groq API Key, STOP and ask for it. Tell that user can get one for free at https://console.groq.com/keys. Inject api key into `.env`.
 3. **Autostart:** Set up daemon autostart (e.g., via a `systemd` user service or compositor config).
 4. **Keybindings:** Identify the WM/Compositor. 
@@ -47,10 +48,11 @@
 ### 🛠️ Prerequisites
 
 Ensure your Linux system has the following dependencies:
-- `ffmpeg`
+- `ffmpeg` (provides `ffplay` for sound feedback)
 - `wl-clipboard` (use `xclip` for X11 and modify the script)
+- `wtype` (for auto-paste on Wayland)
 - `libnotify-bin` or `mako`/`dunst`
-- `pulseaudio-utils`
+
 
 ---
 
@@ -111,7 +113,11 @@ python3 ~/vowit/main.py toggle fixon
 
 *(You can append `fixon` to `toggle_sys` as well)*
 
-Press the hotkey to start recording (startup sound plays). Press it again to stop and process. The transcribed text will appear in your clipboard automatically!
+Press the hotkey to start recording (startup sound plays). Press it again to stop and process.
+
+**Multi-press behaviour (same button):**
+- **Idle:** 1 press → start mic recording, 3 quick presses → start system audio recording
+- **To stop recording:** 1 press → copy to clipboard (`wl-copy`), **2 quick presses** → auto-paste into active window (`Ctrl+Shift+V` + `Enter`, second press must come within 0.6s)
 
 ---
 
@@ -120,6 +126,7 @@ Press the hotkey to start recording (startup sound plays). Press it again to sto
 ```text
 vowit/
   ├── main.py             # Main daemon, async logic, and CLI toggle
+  ├── configure.py        # TUI setup wizard
   ├── silero_vad.onnx     # ONNX model for Voice Activity Detection
   ├── requirements.txt    # Python dependencies
   ├── .env.example        # Configuration template

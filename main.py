@@ -1,12 +1,12 @@
 import os
 import sys
 import signal
+import glob
 
 PID_FILE = "/tmp/groq_audio_daemon.pid"
 
 FIX_FLAG_FILE = "/tmp/groq_audio_fixon.flag"
 
-# Quick toggle path that doesn't require any third-party libraries
 if len(sys.argv) > 1 and sys.argv[1] in ("toggle", "toggle_sys"):
     if "fixon" in sys.argv:
         open(FIX_FLAG_FILE, "w").close()
@@ -49,10 +49,17 @@ import av
 
 from dotenv import load_dotenv
 
-# Load environment variables from .env file relative to this script
 script_dir = os.path.dirname(os.path.abspath(__file__))
 env_path = os.path.join(script_dir, ".env")
 load_dotenv(env_path)
+
+SOUNDS_DIR = os.path.join(script_dir, "sounds")
+
+# Auto-detect Wayland display socket if not set
+if "WAYLAND_DISPLAY" not in os.environ:
+    sockets = glob.glob(f"/run/user/{os.getuid()}/wayland-[0-9]*")
+    if sockets:
+        os.environ["WAYLAND_DISPLAY"] = os.path.basename(sockets[0])
 
 UI_LANGUAGE = os.environ.get("UI_LANGUAGE", "en").lower()
 
@@ -95,10 +102,19 @@ def get_string(key):
     lang = UI_LANGUAGE if UI_LANGUAGE in STRINGS else "en"
     return STRINGS[lang].get(key, STRINGS["en"].get(key, key))
 
-TARGET_RMS = 0.05
-MAX_GAIN = 1.5
+TARGET_RMS = 0.06
+MAX_GAIN = 2.0
 RATE_WHISPER = 16000
 CHUNK_VAD_16K = 512
+CHUNK_SPEECH_SECONDS = float(os.environ.get("CHUNK_SPEECH_SECONDS", "15.0"))
+VAD_THRESHOLD = float(os.environ.get("VAD_THRESHOLD", "0.5"))
+VAD_MIN_SILENCE_MS = int(os.environ.get("VAD_MIN_SILENCE_MS", "200"))
+MULTI_PRESS_WINDOW = float(os.environ.get("MULTI_PRESS_WINDOW", "0.6"))
+STOP_COOLDOWN = float(os.environ.get("STOP_COOLDOWN", "1.0"))
+RECORDING_TIMEOUT = int(os.environ.get("RECORDING_TIMEOUT", "600"))
+NOTIFICATION_DURATION = int(os.environ.get("NOTIFICATION_DURATION", "4"))
+FFMPEG_GRACE = float(os.environ.get("FFMPEG_GRACE", "0.3"))
+PASTE_ENTER_DELAY = float(os.environ.get("PASTE_ENTER_DELAY", "0.2"))
 
 _vad_session = None
 
@@ -144,7 +160,7 @@ class ONNXVAD:
     """Voice Activity Detection using Silero ONNX model."""
 
     def __init__(
-        self, session, threshold=0.7, min_silence_ms=200, chunk_ms=32
+        self, session, threshold=VAD_THRESHOLD, min_silence_ms=VAD_MIN_SILENCE_MS, chunk_ms=32
     ):
         self.session = session
         self.threshold = threshold
@@ -297,7 +313,6 @@ async def process_ready_audio(file_data: bytes, prompt: str = "") -> tuple[str, 
     if not file_data:
         return "", b""
 
-    # Replaced config with env vars as requested.
     groq_api_key = os.environ.get("GROQ_API_KEY", "")
     whisper_model = os.environ.get("WHISPER_MODEL", "whisper-large-v3")
     bot_language = os.environ.get("BOT_LANGUAGE", "ru")
@@ -349,11 +364,13 @@ async def process_ready_audio(file_data: bytes, prompt: str = "") -> tuple[str, 
 
     return "network_error", b""
 
+SOUND_VOLUME = os.environ.get("SOUND_VOLUME", "0.8")
+SOUND_SPEED = os.environ.get("SOUND_SPEED", "2.0")
+
 def play_sound(sound_path):
-    """Plays a sound using paplay, killing any existing paplay instances to prevent overlap issues."""
-    subprocess.run(["pkill", "-x", "paplay"], stderr=subprocess.DEVNULL)
+    subprocess.run(["pkill", "-x", "ffplay"], stderr=subprocess.DEVNULL)
     subprocess.Popen(
-        ["paplay", sound_path],
+        ["ffplay", "-nodisp", "-autoexit", "-af", f"volume={SOUND_VOLUME},atempo={SOUND_SPEED}", sound_path],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL
@@ -366,8 +383,11 @@ def send_notification(title, message, replaces_id=None):
     cmd.extend([title, message])
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        return result.stdout.strip()
-    except subprocess.CalledProcessError:
+        notif_id = result.stdout.strip()
+        logging.debug(f"Notification sent: '{title}' id={notif_id}")
+        return notif_id
+    except subprocess.CalledProcessError as e:
+        logging.warning(f"notify-send failed: {e.stderr}")
         return None
 
 def close_notification(notif_id):
@@ -388,6 +408,13 @@ class AudioDaemon:
         self.read_task = None
         self.processing_task = None
         self.timeout_task = None
+        self._last_toggle = 0.0
+        self._recording_start_time = 0.0
+        self._presses = 0
+        self._last_press_time = 0.0
+        self._output_mode = None  # "clipboard", "paste", None
+        self._stop_cooldown = 0.0
+        self._stop_pending = False
 
         # Real-time processing state
         self.vad = None
@@ -418,9 +445,9 @@ class AudioDaemon:
 
     async def _recording_timeout(self):
         # Wait for 10 minutes (600 seconds)
-        await asyncio.sleep(600)
+        await asyncio.sleep(RECORDING_TIMEOUT)
         if self.is_recording:
-            logging.info("10-minute recording limit reached. Automatically stopping.")
+            logging.info(f"{RECORDING_TIMEOUT}s recording limit reached. Automatically stopping.")
             self.stop_recording()
 
     async def _read_stdout(self, process, limiter, vad, history_q, speech_buffer, transcription_queue):
@@ -461,7 +488,7 @@ class AudioDaemon:
 
                             # Check if we should dispatch a chunk (>= 10 seconds of speech)
                             buffer_len_seconds = (len(speech_buffer) * CHUNK_VAD_16K) / RATE_WHISPER
-                            if buffer_len_seconds >= 10.0:
+                            if buffer_len_seconds >= CHUNK_SPEECH_SECONDS:
                                 chunk_to_send = list(speech_buffer)
                                 speech_buffer.clear()
                                 logging.debug(f"Dispatching chunk of {buffer_len_seconds:.2f}s")
@@ -469,7 +496,7 @@ class AudioDaemon:
                 else:
                     speech_buffer.append(c16)
 
-    def start_recording(self, source="mic"):
+    def start_recording(self, source="mic", startup_sound=True):
         if self.is_recording:
             return
 
@@ -477,7 +504,7 @@ class AudioDaemon:
         self.audio_chunks = []
 
         session = get_vad_session()
-        self.vad = ONNXVAD(session) if session is not None else None
+        self.vad = ONNXVAD(session, threshold=VAD_THRESHOLD) if session is not None else None
         self.limiter = TrueRMSLimiter(target_rms=TARGET_RMS, max_gain=MAX_GAIN)
         self.speech_buffer = []
         self.history_q = deque(maxlen=15)
@@ -498,11 +525,10 @@ class AudioDaemon:
             "-f", "s16le", "-"
         ]
 
-        # Start ffmpeg capture task first so recording begins immediately
         asyncio.create_task(self._start_ffmpeg(ffmpeg_cmd, self.transcription_queue, self.full_transcription))
 
-        # Play start sound
-        play_sound("/usr/share/sounds/freedesktop/stereo/service-login.oga")
+        if startup_sound:
+            play_sound(os.path.join(SOUNDS_DIR, "service-login.oga"))
 
         self._show_notification(title, msg)
 
@@ -517,7 +543,6 @@ class AudioDaemon:
                 words = self.last_final_transcription.split()
                 initial_prompt = " ".join(words[-15:]) if len(words) > 15 else self.last_final_transcription
 
-        # Start transcription worker
         self.worker_task = asyncio.create_task(
             self._transcription_worker(self.transcription_queue, self.full_transcription, prompt=initial_prompt)
         )
@@ -585,7 +610,7 @@ class AudioDaemon:
             self.timeout_task.cancel()
 
         # Play end sound
-        play_sound("/usr/share/sounds/freedesktop/stereo/service-logout.oga")
+        play_sound(os.path.join(SOUNDS_DIR, "service-logout.oga"))
 
         self._show_notification(get_string("processing_title"), get_string("processing_msg"))
 
@@ -605,7 +630,6 @@ class AudioDaemon:
         self.speech_buffer = []
         self.full_transcription = []
 
-        # We schedule processing in background
         self.processing_task = asyncio.create_task(self._process_collected_audio(
             old_process, old_read_task, old_worker_task, old_queue, old_speech_buffer, old_full_transcription
         ))
@@ -614,9 +638,8 @@ class AudioDaemon:
         try:
             finish_start_time = time.perf_counter()
 
-            # Allow a short grace period for ffmpeg to flush the last milliseconds of audio
             if process and process.returncode is None:
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(FFMPEG_GRACE)
                 try:
                     process.terminate()
                 except ProcessLookupError:
@@ -654,7 +677,7 @@ class AudioDaemon:
             text = " ".join(full_transcription).strip()
 
             if "network_error" in full_transcription:
-                play_sound("/usr/share/sounds/freedesktop/stereo/message.oga")
+                play_sound(os.path.join(SOUNDS_DIR, "message.oga"))
                 self._show_notification(get_string("net_error_title"), get_string("net_error_msg"))
 
                 # Filter out the error string and copy whatever text successfully transcribed beforehand
@@ -671,18 +694,23 @@ class AudioDaemon:
                         os.remove(FIX_FLAG_FILE)
                     if text == "network_error":
                         llm_failed = True
-                        play_sound("/usr/share/sounds/freedesktop/stereo/message.oga")
+                        play_sound(os.path.join(SOUNDS_DIR, "message.oga"))
                         self._show_notification(get_string("net_error_title"), get_string("net_error_msg"))
                         text = " ".join(full_transcription).strip() # fallback to un-fixed text to at least copy it
 
                 if text != "network_error" and not llm_failed:
-                    # 1. Copy to clipboard immediately
+                    # Copy to clipboard
                     subprocess.run(["wl-copy"], input=text, text=True)
 
-                    # 2. Play sound
-                    play_sound("/usr/share/sounds/freedesktop/stereo/message-new-instant.oga")
+                    if self._output_mode == "paste":
+                        subprocess.run(["wtype", "-M", "ctrl", "-M", "shift", "-k", "v"])
+                        asyncio.sleep(PASTE_ENTER_DELAY)
+                        subprocess.run(["wtype", "-k", "Return"])
 
-                    # 3. Format and show notification
+                    # Play sound
+                    play_sound(os.path.join(SOUNDS_DIR, "message-new-instant.oga"))
+
+                    # Format and show notification
                     clean_text = " ".join(text.splitlines())[:40]
                     if len(text) > 40:
                         clean_text += "..."
@@ -696,41 +724,121 @@ class AudioDaemon:
                     subprocess.run(["wl-copy"], input=text, text=True)
             else:
                 # Play error sound/silence sound
-                play_sound("/usr/share/sounds/freedesktop/stereo/message.oga")
+                play_sound(os.path.join(SOUNDS_DIR, "message.oga"))
                 if not full_transcription:
                     self._show_notification(get_string("silence_title"), get_string("silence_msg"))
                 else:
                     self._show_notification(get_string("error_title"), get_string("error_msg"))
 
-            # Let the notification stay for 4 seconds, then close it
-            await asyncio.sleep(4)
+            await asyncio.sleep(NOTIFICATION_DURATION)
             self._close_notification()
 
         except Exception as e:
             logging.error(f"Error during audio processing: {e}")
             self._close_notification()
-            play_sound("/usr/share/sounds/freedesktop/stereo/message.oga")
+            play_sound(os.path.join(SOUNDS_DIR, "message.oga"))
             self._show_notification(get_string("sys_error_title"), str(e))
-            await asyncio.sleep(4)
+            await asyncio.sleep(NOTIFICATION_DURATION)
             self._close_notification()
         finally:
             if os.path.exists(FIX_FLAG_FILE):
                 os.remove(FIX_FLAG_FILE)
 
     def toggle(self):
-        if self.is_recording:
-            self.stop_recording()
-        else:
+        now = time.time()
+        if now - self._last_toggle < 0.125:
+            return
+        self._last_toggle = now
+
+        if not self.is_recording and self._stop_pending:
+            self._stop_pending = False
+            self._output_mode = "paste"
+            self._stop_cooldown = now
+            return
+
+        if self._stop_cooldown > 0 and now - self._stop_cooldown < STOP_COOLDOWN:
+            return
+
+        if not self.is_recording:
+            self._recording_start_time = now
+            self._last_press_time = now
             self.start_recording(source="mic")
+            self._presses = 1
+        else:
+            dt = now - self._recording_start_time
+            if dt < MULTI_PRESS_WINDOW:
+                if now - self._last_press_time < 0.125:
+                    return
+                self._last_press_time = now
+                self._presses += 1
+                if self._presses >= 3:
+                    self._cancel_recording()
+                    self._stop_cooldown = now
+                    asyncio.create_task(self._start_sys_with_delay())
+            else:
+                self._output_mode = "clipboard"
+                self._stop_pending = True
+                self._stop_cooldown = now
+                self.stop_recording()
+                asyncio.create_task(self._stop_timeout())
 
     def toggle_sys(self):
+        now = time.time()
+        if now - self._last_toggle < 0.5:
+            return
+        self._last_toggle = now
         if self.is_recording:
+            self._stop_cooldown = now
             self.stop_recording()
         else:
             self.start_recording(source="sys")
 
+    async def _stop_timeout(self):
+        await asyncio.sleep(MULTI_PRESS_WINDOW)
+        self._stop_pending = False
+
+    async def _start_sys_with_delay(self):
+        await asyncio.sleep(0.5)
+        self._recording_start_time = time.time()
+        self.start_recording(source="sys", startup_sound=False)
+
+    def _cancel_recording(self):
+        if not self.is_recording:
+            return
+        self.is_recording = False
+        if self.timeout_task and not self.timeout_task.done():
+            self.timeout_task.cancel()
+        if self.process:
+            try:
+                self.process.terminate()
+            except ProcessLookupError:
+                pass
+        if self.read_task and not self.read_task.done():
+            self.read_task.cancel()
+        if self.worker_task and not self.worker_task.done():
+            self.worker_task.cancel()
+        if self.transcription_queue:
+            self.transcription_queue = None
+        self.process = None
+        self.read_task = None
+        self.worker_task = None
+        self.transcription_queue = None
+        self.speech_buffer = []
+        self.full_transcription = []
+        self._close_notification()
+
 async def main():
-    # Write PID so we can signal this process
+    if os.path.exists(PID_FILE):
+        try:
+            with open(PID_FILE, "r") as f:
+                old_pid = int(f.read().strip())
+            os.kill(old_pid, 0)
+            logging.error(f"Daemon already running with PID {old_pid}. Exiting.")
+            sys.exit(1)
+        except (ProcessLookupError, ValueError):
+            pass
+        os.remove(PID_FILE)
+
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
 
