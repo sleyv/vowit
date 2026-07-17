@@ -2,6 +2,7 @@ import os
 import sys
 import signal
 import glob
+import subprocess
 
 PID_FILE = "/tmp/groq_audio_daemon.pid"
 
@@ -35,11 +36,25 @@ if len(sys.argv) > 1 and sys.argv[1] in ("toggle", "toggle_sys"):
         sys.exit(1)
     sys.exit(0)
 
+if sys.argv[1:2] == ["start"]:
+    SOUNDS_DIR = os.path.join(os.path.dirname(__file__), "sounds")
+    sound = os.path.join(SOUNDS_DIR, "service-login.oga")
+    subprocess.run(["pkill", "-x", "ffplay"], stderr=subprocess.DEVNULL)
+    subprocess.Popen(
+        ["ffplay", "-nodisp", "-autoexit", "-af", "volume=0.9,atempo=1.5", sound],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    subprocess.run(
+        ["notify-send", "Recording from phone", "Hold to talk"],
+        env={**os.environ, "XDG_RUNTIME_DIR": "/run/user/1000"},
+        stderr=subprocess.DEVNULL
+    )
+    sys.exit(0)
+
 import asyncio
 import io
 import struct
 import logging
-import subprocess
 import time
 from collections import deque
 
@@ -114,7 +129,7 @@ STOP_COOLDOWN = float(os.environ.get("STOP_COOLDOWN", "1.0"))
 RECORDING_TIMEOUT = int(os.environ.get("RECORDING_TIMEOUT", "600"))
 NOTIFICATION_DURATION = int(os.environ.get("NOTIFICATION_DURATION", "4"))
 FFMPEG_GRACE = float(os.environ.get("FFMPEG_GRACE", "0.3"))
-PASTE_ENTER_DELAY = float(os.environ.get("PASTE_ENTER_DELAY", "0.2"))
+PASTE_ENTER_DELAY = float(os.environ.get("PASTE_ENTER_DELAY", "0.6"))
 
 _vad_session = None
 
@@ -364,8 +379,8 @@ async def process_ready_audio(file_data: bytes, prompt: str = "") -> tuple[str, 
 
     return "network_error", b""
 
-SOUND_VOLUME = os.environ.get("SOUND_VOLUME", "0.8")
-SOUND_SPEED = os.environ.get("SOUND_SPEED", "2.0")
+SOUND_VOLUME = os.environ.get("SOUND_VOLUME", "0.9")
+SOUND_SPEED = os.environ.get("SOUND_SPEED", "1.5")
 
 def play_sound(sound_path):
     subprocess.run(["pkill", "-x", "ffplay"], stderr=subprocess.DEVNULL)
@@ -399,6 +414,119 @@ def close_notification(notif_id):
         "CloseNotification", "u", str(notif_id)
     ]
     subprocess.run(cmd, stderr=subprocess.DEVNULL)
+
+async def transcribe_file(file_path):
+    if not os.environ.get("GROQ_API_KEY", ""):
+        send_notification("Error", "GROQ_API_KEY not set")
+        return
+
+    notif = send_notification("Processing...", "Transcribing...")
+
+    # convert webm → s16le PCM 16kHz via ffmpeg pipe
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-i", file_path, "-ac", "1", "-ar", "16000",
+        "-f", "s16le", "-",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL
+    )
+    try:
+        raw, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+    except asyncio.TimeoutError:
+        proc.kill()
+        play_sound(os.path.join(SOUNDS_DIR, "message.oga"))
+        send_notification("Error", "Audio conversion timeout")
+        return
+    if not raw:
+        play_sound(os.path.join(SOUNDS_DIR, "message.oga"))
+        send_notification("Error", "Empty audio file")
+        return
+
+    audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+
+    # VAD + limiter
+    session = get_vad_session()
+    vad = ONNXVAD(session) if session else None
+    limiter = TrueRMSLimiter(target_rms=TARGET_RMS, max_gain=MAX_GAIN)
+    history = deque(maxlen=15)
+    speech_buf = []
+    segments = []
+    triggered = False
+    cs = CHUNK_VAD_16K
+
+    for i in range(0, len(audio), cs):
+        chunk = audio[i:i + cs]
+        if len(chunk) < cs:
+            break
+        proc_chunk = limiter.process(chunk)
+        history.append(proc_chunk)
+        if vad:
+            r = vad(proc_chunk)
+            if r == "start":
+                triggered = True
+                hq = list(history)
+                speech_buf.extend(hq[:-1])
+                speech_buf.append(proc_chunk)
+            elif triggered:
+                speech_buf.append(proc_chunk)
+                if r == "end":
+                    triggered = False
+                    history.clear()
+                    segments.append(np.concatenate(speech_buf))
+                    speech_buf = []
+        else:
+            speech_buf.append(proc_chunk)
+
+    if triggered and speech_buf:
+        segments.append(np.concatenate(speech_buf))
+    if not segments:
+        segments = [audio]
+
+    # transcribe each segment
+    texts = []
+    for seg in segments:
+        if len(seg) < 16000 * 0.3:
+            continue
+        wav = _make_wav(seg, 16000)
+        ogg = wav_to_ogg(wav)
+        text, _ = await process_ready_audio(ogg)
+        if text not in ("", "null", "network_error", None):
+            texts.append(text)
+
+    if not texts:
+        play_sound(os.path.join(SOUNDS_DIR, "message.oga"))
+        send_notification("Error", "No speech detected")
+        if notif:
+            close_notification(notif)
+        return
+
+    full = " ".join(texts)
+
+    # LLM fix
+    fix_on = os.path.exists(FIX_FLAG_FILE) or os.environ.get("FIX_GRAMMAR_BY_DEFAULT", "false").lower() == "true"
+    if fix_on:
+        full = await fix_text_with_llm(full)
+        if os.path.exists(FIX_FLAG_FILE):
+            os.remove(FIX_FLAG_FILE)
+        if full == "network_error":
+            play_sound(os.path.join(SOUNDS_DIR, "message.oga"))
+            send_notification("Error", "LLM fix failed")
+            return
+
+    # clipboard
+    subprocess.run(["wl-copy"], input=full, text=True,
+        env={**os.environ, "XDG_RUNTIME_DIR": "/run/user/1000", "WAYLAND_DISPLAY": "wayland-1"})
+
+    play_sound(os.path.join(SOUNDS_DIR, "message-new-instant.oga"))
+    display = " ".join(full.splitlines())[:60]
+    if len(full) > 60:
+        display += "..."
+    send_notification("Done", display)
+    if notif:
+        close_notification(notif)
+
+if sys.argv[1:2] == ["transcribe"]:
+    asyncio.run(transcribe_file(sys.argv[2] if len(sys.argv) > 2 else os.path.expanduser("~/.cache/rtp_assist.webm")))
+    sys.exit(0)
 
 class AudioDaemon:
     def __init__(self):
