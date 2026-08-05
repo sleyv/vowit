@@ -102,8 +102,8 @@ def get_string(key):
     lang = UI_LANGUAGE if UI_LANGUAGE in STRINGS else "en"
     return STRINGS[lang].get(key, STRINGS["en"].get(key, key))
 
-TARGET_RMS = 0.06
-MAX_GAIN = 2.0
+TARGET_RMS = float(os.environ.get("TARGET_RMS", "0.06"))
+MAX_GAIN = float(os.environ.get("MAX_GAIN", "2.0"))
 RATE_WHISPER = 16000
 CHUNK_VAD_16K = 512
 CHUNK_SPEECH_SECONDS = float(os.environ.get("CHUNK_SPEECH_SECONDS", "15.0"))
@@ -115,6 +115,8 @@ RECORDING_TIMEOUT = int(os.environ.get("RECORDING_TIMEOUT", "600"))
 NOTIFICATION_DURATION = int(os.environ.get("NOTIFICATION_DURATION", "4"))
 FFMPEG_GRACE = float(os.environ.get("FFMPEG_GRACE", "0.3"))
 PASTE_ENTER_DELAY = float(os.environ.get("PASTE_ENTER_DELAY", "0.2"))
+FIX_SKIP_SHORT = os.environ.get("FIX_SKIP_SHORT", "true").lower() == "true"
+FIX_MIN_CHARS = int(os.environ.get("FIX_MIN_CHARS", "50"))
 
 _vad_session = None
 
@@ -243,10 +245,31 @@ def wav_to_ogg(wav_bytes: bytes) -> bytes:
         return wav_bytes
 
 
+LLM_MODEL_DEFAULT = "openai/gpt-oss-120b"
+LLM_FALLBACK_DELAY = float(os.environ.get("LLM_FALLBACK_DELAY", "0.8"))
+
+
+def _llm_model_rotation():
+    """Returns up to 5 models to try for grammar fixing, primary first."""
+    primary = os.environ.get("LLM_MODEL", LLM_MODEL_DEFAULT)
+    fallbacks = [
+        m.strip() for m in os.environ.get(
+            "LLM_FALLBACK_MODELS",
+            "qwen/qwen3.6-27b,llama-3.3-70b-versatile,openai/gpt-oss-20b"
+        ).split(",")
+        if m.strip()
+    ]
+    models = [primary] + [m for m in fallbacks if m != primary]
+    return models[:5]
 
 
 async def fix_text_with_llm(text: str) -> str:
-    """Uses Groq's LLM to slightly fix grammar and add paragraphs to the transcribed text."""
+    """Uses an LLM to slightly fix grammar and add paragraphs to the transcribed text.
+
+    Tries the primary model first; if it errors out or returns an empty response,
+    rotates through fallback models (up to 5 attempts total) until one succeeds.
+    Returns "network_error" if all models fail.
+    """
     groq_api_key = os.environ.get("GROQ_API_KEY", "")
     if not groq_api_key:
         return text
@@ -256,28 +279,48 @@ async def fix_text_with_llm(text: str) -> str:
         "Content-Type": "application/json"
     }
 
-    # Use the model the user requested explicitly.
-    model = os.environ.get("LLM_MODEL", "openai/gpt-oss-120b")
     # Allow overriding the base URL in case they use OpenRouter or another provider for the LLM fix
     llm_base_url = os.environ.get("LLM_BASE_URL", "https://api.groq.com/openai/v1/chat/completions")
 
+    # Backup (Variant 1) — компактный, в стиле старого промпта:
+    # system_prompt = (
+    #     "Your task is to slightly fix grammar and divide the text into paragraphs. "
+    #     "The text is a transcribed voice memo, so it may contain miswordings or "
+    #     "phonetic errors. If the speaker asks for formatting inside the message "
+    #     "(e.g., \"summarize the beginning in 20 words\" or \"split into paragraphs\"), "
+    #     "follow that request, but remove the request itself from the output. "
+    #     "Keep the original language of the text; do not translate it unless the "
+    #     "speaker explicitly asks to. Do not use the em dash (—) symbol. "
+    #     "Example: raw: \"meet at cafe tomorrow noon bring laptops\" -> fixed: "
+    #     "\"Meet at the cafe tomorrow at noon. Bring laptops.\" "
+    #     "Make minimal changes. Do not remake the text fully. Respond ONLY with the fixed text."
+    # )
     system_prompt = (
-        "Your task is to slightly fix grammar and divide the text into paragraphs. "
-        "Please note that the text is a transcribed voice memo, so it may contain "
-        "miswordings or phonetic errors. Account for this in your corrections. "
-        "Make minimal changes. Do not remake the text fully. Respond ONLY with the fixed text."
+        "Your task is to clean up a transcribed voice memo: fix grammar and punctuation, "
+        "and divide the text into paragraphs. Remember it is raw speech — expect phonetic "
+        "errors, dropped words, and missing punctuation. Make minimal changes; do not rewrite "
+        "the message. Keep the original language of the text; do not translate it into another "
+        "language unless the speaker explicitly asks to. Do not use the em dash (—) symbol; "
+        "use commas, colons, or other punctuation instead. "
+        "If the speaker explicitly asks for something inside the message (e.g., "
+        "\"summarize the beginning in 20 words\", \"format as a list\", \"add headings\"), "
+        "honor that request, then delete the request itself from the result so only the "
+        "actual content remains. "
+        "Example:\nRaw:  \"meet at cafe tomorrow noon bring laptops\"\n"
+        "Fixed: \"Meet at the cafe tomorrow at noon. Bring laptops.\"\n"
+        "Respond ONLY with the fixed text."
     )
 
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": text}
-        ],
-        "temperature": 0.2
-    }
+    for model in _llm_model_rotation():
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text}
+            ],
+            "temperature": 0.2
+        }
 
-    for attempt in range(3):
         try:
             start_time = time.perf_counter()
             async with aiohttp.ClientSession() as session_http:
@@ -286,22 +329,30 @@ async def fix_text_with_llm(text: str) -> str:
                     headers=headers,
                     json=payload,
                 ) as resp:
+                    if resp.status == 429:
+                        err = await resp.text()
+                        logging.warning(f"LLM {model} rate limited (429): {err}")
+                        await asyncio.sleep(3)
+                        continue
                     if resp.status != 200:
                         err = await resp.text()
-                        logging.error(f"LLM API Error {resp.status}: {err}")
-                        return text
+                        logging.warning(f"LLM {model} API Error {resp.status}: {err}")
+                        await asyncio.sleep(LLM_FALLBACK_DELAY)
+                        continue
                     json_resp = await resp.json()
                     fixed_text = json_resp.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                    if not fixed_text:
+                        logging.warning(f"LLM {model} returned empty response")
+                        await asyncio.sleep(LLM_FALLBACK_DELAY)
+                        continue
                     elapsed = time.perf_counter() - start_time
-                    logging.info(f"LLM grammar correction took {elapsed:.2f}s")
-                    return fixed_text if fixed_text else text
+                    logging.info(f"LLM grammar correction ({model}) took {elapsed:.2f}s")
+                    return fixed_text
         except aiohttp.ClientError as e:
-            logging.error(f"Network error calling LLM API (attempt {attempt + 1}/3): {e}")
-            if attempt < 2:
-                await asyncio.sleep(1)
+            logging.warning(f"Network error calling LLM API with {model}: {e}")
         except Exception as e:
-            logging.error(f"Error calling Groq LLM API: {e}")
-            return text
+            logging.warning(f"Error calling LLM API with {model}: {e}")
+            await asyncio.sleep(LLM_FALLBACK_DELAY)
 
     return "network_error"
 
@@ -404,7 +455,6 @@ class AudioDaemon:
     def __init__(self):
         self.is_recording = False
         self.process = None
-        self.audio_chunks = []
         self.read_task = None
         self.processing_task = None
         self.timeout_task = None
@@ -421,8 +471,6 @@ class AudioDaemon:
         self.limiter = None
         self.speech_buffer = []
         self.history_q = None
-        self.state_speech = False
-        self.chunk_remainder = b""
 
         # Chunking/Streaming state
         self.transcription_queue = None
@@ -508,8 +556,6 @@ class AudioDaemon:
         self.limiter = TrueRMSLimiter(target_rms=TARGET_RMS, max_gain=MAX_GAIN)
         self.speech_buffer = []
         self.history_q = deque(maxlen=15)
-        self.state_speech = False
-        self.chunk_remainder = b""
 
         self.transcription_queue = asyncio.Queue()
         self.full_transcription = []
@@ -634,7 +680,9 @@ class AudioDaemon:
             old_process, old_read_task, old_worker_task, old_queue, old_speech_buffer, old_full_transcription
         ))
 
-    async def _process_collected_audio(self, process, read_task, worker_task, queue, speech_buffer, full_transcription):
+    async def _process_collected_audio(
+        self, process, read_task, worker_task, queue, speech_buffer, full_transcription
+    ):
         try:
             finish_start_time = time.perf_counter()
 
@@ -686,10 +734,15 @@ class AudioDaemon:
                     subprocess.run(["wl-copy"], input=clean_transcription, text=True)
             elif text and text != "null":
                 llm_failed = False
-                fix_enabled = os.path.exists(FIX_FLAG_FILE) or os.environ.get("FIX_GRAMMAR_BY_DEFAULT", "false").lower() == "true"
+                fix_enabled = os.path.exists(FIX_FLAG_FILE) or os.environ.get(
+                    "FIX_GRAMMAR_BY_DEFAULT", "false"
+                ).lower() == "true"
 
                 if fix_enabled:
-                    text = await fix_text_with_llm(text)
+                    if FIX_SKIP_SHORT and len(text) < FIX_MIN_CHARS:
+                        logging.info(f"Text too short ({len(text)} chars < {FIX_MIN_CHARS}), skipping LLM fix")
+                    else:
+                        text = await fix_text_with_llm(text)
                     if os.path.exists(FIX_FLAG_FILE):
                         os.remove(FIX_FLAG_FILE)
                     if text == "network_error":
@@ -704,7 +757,7 @@ class AudioDaemon:
 
                     if self._output_mode == "paste":
                         subprocess.run(["wtype", "-M", "ctrl", "-M", "shift", "-k", "v"])
-                        asyncio.sleep(PASTE_ENTER_DELAY)
+                        await asyncio.sleep(PASTE_ENTER_DELAY)
                         subprocess.run(["wtype", "-k", "Return"])
 
                     # Play sound
